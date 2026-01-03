@@ -112,24 +112,18 @@ class TrainingComponents(pydantic.BaseModel):
         if not self.output_dir:
             return False
 
-        # Check if directory exists
-        if not os.path.exists(self.output_dir):
-            # Check if we can create it by checking parent directory permissions
-            parent_dir = os.path.dirname(self.output_dir) or "."
-            if not os.path.exists(parent_dir) or not os.access(parent_dir, os.W_OK):
-                return False
-
-        # Check if we have write permissions
-        if not os.access(self.output_dir, os.W_OK):
+        # Try to create the directory if it doesn't exist
+        try:
+            os.makedirs(self.output_dir, exist_ok=True)
+            return True
+        except (OSError, PermissionError):
             return False
-
-        return True
 
     def save_checkpoint(self, epoch: int):
         # create root directory
         save_dir = os.path.join(self.output_dir, f"epoch_{epoch}")
         if not os.path.exists(save_dir):
-            os.makedirs(self.output_dir, exist_ok=True)
+            os.makedirs(save_dir, exist_ok=True)
 
         # write the model there
         self.model.save_pretrained(save_dir)

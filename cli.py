@@ -612,6 +612,8 @@ def train(
         model_name,
         device_map=train_device,  # attn_implementation="flash_attention_2"
     )
+    ref_model.eval()
+    ref_model.requires_grad_(False)
     tokenizer: Qwen2Tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     # align tokenizer and tokens
