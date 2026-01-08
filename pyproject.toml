@@ -6,7 +6,18 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "datasets>=4.4.2",
-    "instructlab-training>=0.12.1",
+    "ipykernel>=7.1.0",
     "ipython>=9.8.0",
+    "numba>=0.61.2",
     "typer>=0.21.0",
+    "vllm>=0.13.0",
 ]
+
+[project.optional-dependencies]
+cuda = ["flash-attn"]
+
+[tool.uv]
+no-build-isolation-package = ["flash-attn"]
+
+[tool.uv.extra-build-dependencies]
+cuda = [{ requirement = "torch", match-runtime = true }]
