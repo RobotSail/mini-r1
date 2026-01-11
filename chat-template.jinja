@@ -81,6 +81,6 @@
 
     {# add the generation prompt #}
     {%- if loop.last and add_generation_prompt -%}
-        {{- '<|im_start|>assistant\n<think>' -}}
+        {{- '<|im_start|>assistant\n' -}}
     {%- endif -%}
 {%- endfor -%}

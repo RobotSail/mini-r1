@@ -5,10 +5,15 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "accelerate>=1.12.0",
+    "asyncio>=4.0.0",
     "datasets>=4.4.2",
+    "httpx>=0.28.1",
     "ipykernel>=7.1.0",
     "ipython>=9.8.0",
+    "mistral-common>=1.8.8",
     "numba>=0.61.2",
+    "openai>=2.14.0",
     "typer>=0.21.0",
     "vllm>=0.13.0",
 ]
