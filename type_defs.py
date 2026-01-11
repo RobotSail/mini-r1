@@ -175,7 +175,6 @@ class RolloutResult(pydantic.BaseModel):
 
         return RolloutScore(
             reward=format_reward + acc_reward,
-            advantage=0.0,
             is_correct=acc_reward == 1.0,
             is_parsable=format_reward == 1.0,
         )
@@ -348,6 +347,8 @@ class Hyperparameters(pydantic.BaseModel):
     adamw_betas: tuple[float, float] = (0.9, 0.999)
     adamw_wd: float = 0.01
 
+    update_ref_policy_every_n_steps: int = -1  # off by default
+
     # change this one to a ratio
     inner_batch_size: int
     eps: float = 0.1  # or 0.2 as in deepseek's original paper
@@ -372,7 +373,7 @@ class TrainingContext(pydantic.BaseModel):
     model: PreTrainedModel | None = None
     ref_model: PreTrainedModel | None = None
     tokenizer: PreTrainedTokenizerBase | None = None
-    hyperparams: Hyperparameters
+    hparams: Hyperparameters
     device: torch.device = pydantic.Field(default_factory=lambda: torch.device("cuda", int(os.environ["LOCAL_RANK"])))
     sampling_params: SamplingParams
     device_mesh: DeviceMesh | None = None  # this will start out being none
@@ -380,6 +381,9 @@ class TrainingContext(pydantic.BaseModel):
     vllm_url: str
     vllm_model_name: str
     vllm_model_dir: str
+    train_path: str
+    eval_split: float = 0.0
+    output_dir: str | None = None
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -420,9 +424,9 @@ class TrainingContext(pydantic.BaseModel):
 
         self.optimizer = AdamW(
             self.model.parameters(),
-            lr=self.hyperparams.lr,
-            betas=self.hyperparams.adamw_betas,
-            weight_decay=self.hyperparams.adamw_wd,
+            lr=self.hparams.lr,
+            betas=self.hparams.adamw_betas,
+            weight_decay=self.hparams.adamw_wd,
         )
 
     def create_device_mesh(self):
@@ -706,7 +710,7 @@ class TrainingContext(pydantic.BaseModel):
         """
 
         include_logprobs = True if include_logprobs is None else include_logprobs
-        n_completions = self.hyperparams.group_size if n_completions is None else n_completions
+        n_completions = self.hparams.group_size if n_completions is None else n_completions
 
         # so we want to loop through all of our samples in the dataset
         # basically we want to take a batch of samples and inititate a network request,
@@ -727,3 +731,12 @@ class TrainingContext(pydantic.BaseModel):
         self._policy_has_changed = True
         self.optimizer.zero_grad()
         return gradnorm
+
+    def save_checkpoint(self, suffix: str | None = None):
+        save_dir = os.path.join(self.output_dir)
+        if suffix:
+            save_dir = os.path.join(self.output_dir, suffix)
+
+        os.makedirs(suffix, exist_ok=True)
+        log_rank_0(f"saving checkpoint at {save_dir:!}")
+        self.save_model(save_dir, self.model, self.tokenizer, torch.float32)

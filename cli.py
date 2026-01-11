@@ -43,6 +43,8 @@ from type_defs import (
 import threading
 import sys
 import subprocess
+import torch.distributed.fsdp as fsdp
+from torch.distributed.checkpoint.state_dict import get_model_state_dict, StateDictOptions, set_model_state_dict
 
 # # load the model once and save
 from model_utils import prepare_model
@@ -58,51 +60,10 @@ logging.basicConfig(
     handlers=[RichHandler(rich_tracebacks=False, show_path=False)],
 )
 log = logging.getLogger("mini-r1")
+# httpx is verbose so we limit the verbosity here
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 app = Typer(pretty_exceptions_enable=False)
-
-
-def send_chat_completion(
-    prompt: str,
-    system_prompt: str,
-    model: str = "qwen/Qwen2-1.5B-Instruct",
-    base_url: str = "http://localhost:8000/v1",
-    temperature: float = 0.7,
-    max_tokens: int = 512,
-):
-    """Send a chat completion request to vLLM server."""
-    url = f"{base_url}/chat/completions"
-
-    headers = {"Content-Type": "application/json"}
-
-    data = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-    }
-
-    response = requests.post(url, headers=headers, json=data)
-    response.raise_for_status()
-
-    return response.json()
-
-
-def parse_number(text: str) -> int | float:
-    """Try to parse a string into a number which is assumed to been inside of the answer tags using the <answer>...</answer> format."""
-    try:
-        if not any(c.isdigit() for c in text):
-            raise ValueError(f"No digits found in answer tags: {text}.")
-        if "." in text:
-            return float(text)
-        else:
-            return int(text)
-
-    except ValueError as ve:
-        raise ValueError(f"Could not extract answer from field: {text} (invalid integer): {ve}.")
 
 
 @app.command()
@@ -146,53 +107,6 @@ def generate_data(
         test.to_json(test_path)
         log.info(f"✓ Generated {len(test)} test examples")
         log.info(f"✓ Saved test data to '{test_path}'")
-
-
-@torch.no_grad
-def simple_rollouts(ctx: TrainingContext, batch: list[Problem], is_eval=False, n_completions=None):
-    log_rank_0("making call to update vLLM policy")
-    ctx.update_vllm_policy()
-    if not is_eval:
-        return ctx.generate_completions(batch)
-
-    kwargs = {}
-    if n_completions is not None and n_completions > 0:
-        kwargs["n_completions"] = n_completions
-    return ctx.generate_completions(batch, include_logprobs=False, only_run_on_main=True, **kwargs)
-
-
-@torch.no_grad
-def eval_model(eval_dataset: ProblemDataset, ctx: TrainingContext):
-    # we generate all the rollouts
-    # eval_data = eval_dataset.batch(eval_dataset.num_rows)
-    pass_at = [
-        1,
-    ]  #  3,#  5, 10]
-    results = []
-    eval_problems = [prob for prob in eval_dataset]
-
-    for npass in pass_at:
-        # need to generate the whole dataset
-        samples = simple_rollouts(ctx, eval_problems, is_eval=True, n_completions=npass)
-
-        # now we go and determine the passing rate
-        percent_scores = []
-        for sample in samples:
-            passing_rate = sum(1 if r.score.is_correct else 0 for r in sample.rollouts) / len(sample.rollouts)
-            percent_scores.append(passing_rate)
-        # Calculate statistics
-        percent_above_50 = sum(1 if score > 0.5 else 0 for score in percent_scores) / max(len(percent_scores), 1) * 100
-        percent_at_100 = sum(1 if score == 1.0 else 0 for score in percent_scores) / max(len(percent_scores), 1) * 100
-
-        results.append((npass, percent_above_50, percent_at_100))
-
-    # Print all results at the end
-    log.info("=== Evaluation Scorecard ===")
-    log.info(f"Total samples evaluated: {len(samples)}")
-    for npass, percent_above_50, percent_at_100 in results:
-        log.info(
-            f"Pass@{npass}: {percent_above_50:.1f}% above 50% | {percent_at_100:.1f}% at 100% (across {len(samples)} samples with {npass} rollout(s) each)"
-        )
 
 
 @app.command()
@@ -253,188 +167,327 @@ def eval(
     log.info(f"Pass@{group_size}: {percent_above_50:.1f}% above 50% | {percent_at_100:.1f}% at 100%")
 
 
-def train_policy_on_rollouts(samples: list[Sample], ctx: TrainingContext):
-    ctx.model.train()
+class GRPOTrainer:
+    ctx: TrainingContext
+    train_dataset: ProblemDataset
+    eval_dataset: ProblemDataset
+    train_loader: torch.utils.data.DataLoader
 
-    # we need to create a dataset here
-    # configure tokenizer first
-    # create the 'dataset'
-    data_loader = create_grpo_data_loader(ctx, samples)
+    def __init__(self, ctx: TrainingContext):
+        self.ctx = ctx
+        # load the dataset
+        self.train_dataset, self.eval_dataset = ProblemDataset.from_jsonl(ctx.train_path, ctx.eval_split)
+        self.train_loader = create_distributed_data_loader(self.train_dataset, self.ctx.hparams.batch_size)
+        self._training_step = 0
 
-    # so then we need to create a dataset from the rollouts
-    # our dataset needs:
-    #  1. messages
-    #  2. advantage for rollout
-    #  3. logprobs
+        # Print dataset statistics
+        log.info(f"✓ Loaded {len(self.train_dataset)} training samples")
+        if self.eval_dataset:
+            log.info(f"✓ Loaded {len(self.eval_dataset)} evaluation samples")
 
-    # now we train
-    for epoch in range(ctx.hyperparams.inner_epochs):
-        # generate the random set
-        for batch in data_loader:
-            """
-            minibatch here has columns input_ids, labels, advantage. it is indexed column-first and row-second
-            """
+        # check if we need to write into output dir
+        if self.ctx.output_dir is not None and not self.ctx.valid_save_dir():
+            log.error(f"Cannot write to output directory '{self.ctx.output_dir}'")
+            raise typer.Exit(code=1)
 
-            # next step, do a minibatch of rollouts
+    def initialize(self):
+        # load models
+        self.ctx.load_models()
+        self.ctx.wrap_models_with_fsdp2()
 
-            """
-            Okay so the next thing we have to do is make this training function work for all groups
-            and all batches. 
-            
-            These are the things we need to fix:
-            
-            1. Model needs to consume multiple inputs
-            2. Importance ratio calculated with multiple inputs + advantages
-            3. KL divergence has to be adjusted to work with multiple inputs
-            4. Loss has to be adjusted to work with multiple inputs
-            5. We need to add sequence-level averaging
-                (all rollouts are considered independent, each rollout's token loss is averaged by the number
-                of tokens in that rollout)
+    @torch.no_grad
+    def simple_rollouts(self, batch: list[Problem], is_eval=False, n_completions=None):
+        log_rank_0("making call to update vLLM policy")
+        self.ctx.update_vllm_policy()
+        if not is_eval:
+            return self.ctx.generate_completions(batch)
 
-            """
+        kwargs = {}
+        if n_completions is not None and n_completions > 0:
+            kwargs["n_completions"] = n_completions
+        return self.ctx.generate_completions(batch, include_logprobs=False, only_run_on_main=True, **kwargs)
 
-            # send everything to GPU as needed
-            input_ids = batch["input_ids"].to(ctx.device).unsqueeze(0)
-            logprob_ids = batch["logprob_ids"].to(ctx.device).unsqueeze(0)
-            advantages = batch["advantages"].to(ctx.device).unsqueeze(0)
-            old_logprobs = batch["logprobs"].to(ctx.device).unsqueeze(0)
-            grpo_logit_mask = batch["grpo_mask"].to(ctx.device).unsqueeze(0)
-            scalars = batch["scalars"].to(ctx.device).unsqueeze(0)
-            position_ids = batch["position_ids"].to(ctx.device).unsqueeze(0)
-            batch_size = batch["batch_size"]
+    @torch.no_grad
+    def eval_model(self):
+        # here we want to evaluate the model with vllm
+        if not self.eval_dataset or len(self.eval_dataset) == 0:
+            log_rank_0("no eval dataset present, skipping evaluation")
+            return
 
-            # we're not calculating cross-entropy against static labels, so no label inputs
-            # are needed here
-            # print("just before calling model.forward")
-            # dist.breakpoint()
-            new_outputs = ctx.model(
-                input_ids=input_ids,
-                position_ids=position_ids,
+        # we generate all the rollouts
+        # eval_data = eval_dataset.batch(eval_dataset.num_rows)
+        pass_at = [
+            1,
+        ]  #  3,#  5, 10]
+        results = []
+        eval_problems = [prob for prob in self.eval_dataset]
+
+        for npass in pass_at:
+            # need to generate the whole dataset
+            samples = self.simple_rollouts(eval_problems, is_eval=True, n_completions=npass)
+
+            # now we go and determine the passing rate
+            percent_scores = []
+            for sample in samples:
+                passing_rate = sum(1 if r.score.is_correct else 0 for r in sample.rollouts) / len(sample.rollouts)
+                percent_scores.append(passing_rate)
+            # Calculate statistics
+            percent_above_50 = (
+                sum(1 if score > 0.5 else 0 for score in percent_scores) / max(len(percent_scores), 1) * 100
             )
-            # print("just after calling model.forward")
-            # dist.breakpoint()
+            percent_at_100 = (
+                sum(1 if score == 1.0 else 0 for score in percent_scores) / max(len(percent_scores), 1) * 100
+            )
 
-            # (1, B, V)
-            new_logits = new_outputs.logits
+            results.append((npass, percent_above_50, percent_at_100))
 
-            # account for sampling temperature
-            if ctx.sampling_params.temperature > 0:
-                new_logits /= ctx.sampling_params.temperature
+        # Print all results at the end
+        log.info("=== Evaluation Scorecard ===")
+        log.info(f"Total samples evaluated: {len(samples)}")
+        for npass, percent_above_50, percent_at_100 in results:
+            log.info(
+                f"Pass@{npass}: {percent_above_50:.1f}% above 50% | {percent_at_100:.1f}% at 100% (across {len(samples)} samples with {npass} rollout(s) each)"
+            )
 
-            # now let's get the reference logits, but we really want to make sure that we don't
-            # backprop on this model
-            with torch.no_grad():
-                ref_outputs = ctx.ref_model(input_ids, position_ids=position_ids)
-                ref_logits = ref_outputs.logits
-                if ctx.sampling_params.temperature > 0:
-                    ref_logits /= ctx.sampling_params.temperature
+    @torch.no_grad()
+    def update_reference_policy(self):
+        log_rank_0("updating reference policy")
+        dist.barrier()
 
-            # we need the new logprobs
-            # new logprobs will be of size (1, B, V), so IDS need to be of shape (1, B, 1)
-            # logprob IDS are (1, B), so we unsqueeze into V
+        # first we must gather original policy
+        policy_sd = get_model_state_dict(
+            self.ctx.model,
+            options=StateDictOptions(
+                ignore_frozen_params=True,
+                full_state_dict=False,
+            ),
+        )
+        set_model_state_dict(
+            self.ctx.ref_model, policy_sd, options=StateDictOptions(ignore_frozen_params=False, full_state_dict=False)
+        )
+        dist.barrier()
+        log_rank_0("finished updating state dicts")
 
-            # prepare for GRPO loss calculation, pluck out the logits that we're going to work with
-            # 1. create the indices
-            # TODO: implement this
-            gather_indices = logprob_ids.clone().unsqueeze(-1)  # (1, B*T, 1)
+    @torch.no_grad()
+    def take_training_step(self):
+        # take an optimization step
+        # TODO: responsibility needs to be redistributed between ctx and trainer
+        # this optimize step for example should probably live here
+        gradnorm = self.ctx.policy_optimize_step()
+        self._training_step += 1
 
-            # 2. Calculate the latest logprobs
-            # more efficient technique
-            # TODO: fix this
-            new_gathered_logits = new_logits.gather(dim=-1, index=gather_indices)
-            new_logsumexp = new_logits.logsumexp(dim=-1, keepdim=True)  # (B, T, 1)
-            new_logprobs = (new_gathered_logits - new_logsumexp).squeeze(-1)
+        # check if it's time to update the reference policy
+        if (
+            self.ctx.hparams.update_ref_policy_every_n_steps > 0
+            and self._training_step % self.ctx.hparams.update_ref_policy_every_n_steps == 0
+        ):
+            self.update_reference_policy()
 
-            # new_logprobs: torch.Tensor = new_logits.log_softmax(dim=-1)
-            # # (B, T, V) --> (B, T, 1)
-            # new_logprobs = new_logprobs.gather(dim=-1, index=gather_indices)
-            # # (B, T, 1) --> (B, T)
-            # new_logprobs = new_logprobs.squeeze(-1)
-            assert len(new_logprobs.shape) == 2
+        return gradnorm
 
-            # 3. Calculate the ref logprobs
-            with torch.no_grad():
-                ref_gathered_logits = ref_logits.gather(dim=-1, index=gather_indices)
-                ref_logsumexp = ref_logits.logsumexp(dim=-1, keepdim=True)  # (B, T, 1)
-                ref_logprobs = (ref_gathered_logits - ref_logsumexp).squeeze(-1)
+    def train(self):
+        # initial eval before we start
+        self.eval_model()
 
-            # 4. Compute  te importance ratio
-            # here's where we need to actually compute the loss. first thing we need is to calculate
-            # the importance ratio:
-            # \rho(\theta_0)=\exp(\log p_{\theta_0}-\log p_{\text{old}})
-            assert old_logprobs.shape == new_logprobs.shape
-            importance_ratio: torch.Tensor = (new_logprobs - old_logprobs).exp()
-            # log_rank_0(f"{importance_ratio.shape=}")
+        # now we iterate
+        for epoch in range(self.ctx.hparams.epochs):
+            pbar = tqdm(
+                self.train_loader,
+                desc=f"Epoch {epoch + 1}/{self.ctx.hparams.epochs}",
+                total=len(self.train_loader),
+            )
+            for batch in pbar:
+                # here we need to create a set of rollouts for each prompt
+                rollouts = self.simple_rollouts(batch)
+                dist.barrier()
 
-            # 5. Next we calculate the clipped surrogate objective
-            # adjust advantage so it can broadcast cleanly
-            # advantages = advantages.unsqueeze(-1)  # (B,) --> (B, 1)
-            # advantages is already (1, B) so no need to unsqueeze
-            # log_rank_0(f"{advantages.shape=}")
+                # Calculate average reward for this batch
+                total_rewards = sum(rollout.score.reward for sample in rollouts for rollout in sample.rollouts)
+                total_rollouts = sum(len(sample.rollouts) for sample in rollouts)
+                avg_reward = total_rewards / total_rollouts if total_rollouts > 0 else 0.0
 
-            # (B, 1) * (B, T)
+                # Update tqdm postfix with average reward
+                pbar.set_postfix({"avg_reward": f"{avg_reward:.4f}"})
 
-            # (1,B) * (1,B)
-            unclipped = advantages * importance_ratio
-            # (1,B) * (1,B)
-            clipped = advantages * importance_ratio.clamp(1 - ctx.hyperparams.eps, 1 + ctx.hyperparams.eps)
-            # log_rank_0(f"{advantages.shape=}")
-            # log_rank_0(f"{clipped.shape=}")
-            # log_rank_0(f"{unclipped.shape=}")
-            clipped_surrogate = torch.minimum(unclipped, clipped)
-            # log_rank_0(f"{clipped_surrogate.shape=}")
-            # dist.breakpoint()
+                # now that we've generated G rollouts for our B groups of prompts,
+                # we convert this into a dataset and update the trainable policy on it
+                self.train_policy_on_rollouts(rollouts)
+                dist.barrier()
 
-            # 6. Next, we need to calculate the approximate KL penalty to the ref policy
-            # KL(policy_new || policy_ref) ~= policy_ref/policy_new - log(policyref/policy_new) - 1
-            dkl_approx = (ref_logprobs - new_logprobs).exp() - (ref_logprobs - new_logprobs) - 1
-            # log_rank_0(f"{ref_logprobs.shape=}")
-            # log_rank_0(f"{new_logprobs.shape=}")
-            # log_rank_0(f"{dkl_approx.shape=}")
+            # evaluate the model
+            self.eval_model()
+            dist.barrier()
 
-            # 7. Compute per-token loss L_GRPO = L_clip - L_kl
-            # compute the per-sample loss (loss for all samples is independent at this point)
-            assert dkl_approx.shape == clipped_surrogate.shape, f"{dkl_approx.shape=} != {clipped_surrogate.shape=}"
-            per_token_loss = clipped_surrogate - ctx.hyperparams.kl_penalty_strength * dkl_approx
+            # save a checkpoint for the current epoch
+            # TODO: bring back real checkpointing
+            self.ctx.save_checkpoint(f"epoch_{epoch}")
 
-            # 8. Mask out all invalid logprobs that aren't from the GRPO rollouts
-            grpo_token_loss = per_token_loss * grpo_logit_mask.float()
+    def train_policy_on_rollouts(self, samples: list[Sample]):
+        self.ctx.model.train()
 
-            # --- loss aggregation ---
-            # 9. Next, we average each batch by the **sequence length**, then we average by the group-size
-            # Warning: sequence-length averaging assigns greater weight to shorter sequences than longer ones
-            # but in our case this is fine, since we only care about an objective reward
-            # (B,) --> (B, 1)
+        # we need to create a dataset here
+        # configure tokenizer first
+        # create the 'dataset'
+        data_loader = create_grpo_data_loader(self.ctx, samples)
 
-            # now we divide each token loss by the number of logprobs
-            # this achieves length averaging.
-            grpo_token_loss = grpo_token_loss / scalars.float()
+        # so then we need to create a dataset from the rollouts
+        # our dataset needs:
+        #  1. messages
+        #  2. advantage for rollout
+        #  3. logprobs
 
-            # this should achieve the group average
-            grpo_sequence_loss = grpo_token_loss.sum(dim=-1) / batch_size
-            grpo_loss = -grpo_sequence_loss
-            # dist.breakpoint()
+        # now we train
+        for epoch in range(self.ctx.hparams.inner_epochs):
+            # generate the random set
+            for batch in data_loader:
+                """
+                minibatch here has columns input_ids, labels, advantage. it is indexed column-first and row-second
+                """
 
-            # FSDP2 averages by world size, so we need to undo it
-            # grpo_loss *= dist.get_world_size()
+                # next step, do a minibatch of rollouts
 
-            # backprop
-            grpo_loss.backward()
+                """
+                Okay so the next thing we have to do is make this training function work for all groups
+                and all batches. 
+                
+                These are the things we need to fix:
+                
+                1. Model needs to consume multiple inputs
+                2. Importance ratio calculated with multiple inputs + advantages
+                3. KL divergence has to be adjusted to work with multiple inputs
+                4. Loss has to be adjusted to work with multiple inputs
+                5. We need to add sequence-level averaging
+                    (all rollouts are considered independent, each rollout's token loss is averaged by the number
+                    of tokens in that rollout)
+    
+                """
 
-            # we optimize the model
+                # send everything to GPU as needed
+                input_ids = batch["input_ids"].to(self.ctx.device).unsqueeze(0)
+                logprob_ids = batch["logprob_ids"].to(self.ctx.device).unsqueeze(0)
+                advantages = batch["advantages"].to(self.ctx.device).unsqueeze(0)
+                old_logprobs = batch["logprobs"].to(self.ctx.device).unsqueeze(0)
+                grpo_logit_mask = batch["grpo_mask"].to(self.ctx.device).unsqueeze(0)
+                scalars = batch["scalars"].to(self.ctx.device).unsqueeze(0)
+                position_ids = batch["position_ids"].to(self.ctx.device).unsqueeze(0)
+                batch_size = batch["batch_size"]
 
-            with torch.no_grad():
-                # take an optimization step
-                gradnorm = ctx.policy_optimize_step()
+                # we're not calculating cross-entropy against static labels, so no label inputs
+                # are needed here
+                # print("just before calling model.forward")
+                # dist.breakpoint()
+                new_outputs = self.ctx.model(
+                    input_ids=input_ids,
+                    position_ids=position_ids,
+                )
+                # print("just after calling model.forward")
+                # dist.breakpoint()
 
-                # log metrics
+                # (1, B, V)
+                new_logits = new_outputs.logits
+
+                # account for sampling temperature
+                if self.ctx.sampling_params.temperature > 0:
+                    new_logits /= self.ctx.sampling_params.temperature
+
+                # now let's get the reference logits, but we really want to make sure that we don't
+                # backprop on this model
+                with torch.no_grad():
+                    ref_outputs = self.ctx.ref_model(input_ids, position_ids=position_ids)
+                    ref_logits = ref_outputs.logits
+                    if self.ctx.sampling_params.temperature > 0:
+                        ref_logits /= self.ctx.sampling_params.temperature
+
+                # we need the new logprobs
+                # new logprobs will be of size (1, B, V), so IDS need to be of shape (1, B, 1)
+                # logprob IDS are (1, B), so we unsqueeze into V
+
+                # prepare for GRPO loss calculation, pluck out the logits that we're going to work with
+                # 1. create the indices
+                gather_indices = logprob_ids.clone().unsqueeze(-1)  # (1, B*T, 1)
+
+                # 2. Calculate the latest logprobs
+                # more efficient technique
+                new_gathered_logits = new_logits.gather(dim=-1, index=gather_indices)
+                new_logsumexp = new_logits.logsumexp(dim=-1, keepdim=True)  # (1, B, 1)
+                new_logprobs = (new_gathered_logits - new_logsumexp).squeeze(-1)  # (1, B)
+                assert len(new_logprobs.shape) == 2
+
+                # 3. Calculate the ref logprobs
+                with torch.no_grad():
+                    ref_gathered_logits = ref_logits.gather(dim=-1, index=gather_indices)
+                    ref_logsumexp = ref_logits.logsumexp(dim=-1, keepdim=True)  # (B, T, 1)
+                    ref_logprobs = (ref_gathered_logits - ref_logsumexp).squeeze(-1)
+
+                # 4. Compute  te importance ratio
+                # here's where we need to actually compute the loss. first thing we need is to calculate
+                # the importance ratio:
+                # \rho(\theta_0)=\exp(\log p_{\theta_0}-\log p_{\text{old}})
+                assert old_logprobs.shape == new_logprobs.shape
+                importance_ratio: torch.Tensor = (new_logprobs - old_logprobs).exp()
+                # log_rank_0(f"{importance_ratio.shape=}")
+
+                # 5. Next we calculate the clipped surrogate objective
+                # adjust advantage so it can broadcast cleanly
+                # advantages = advantages.unsqueeze(-1)  # (B,) --> (B, 1)
+                # advantages is already (1, B) so no need to unsqueeze
+                # log_rank_0(f"{advantages.shape=}")
+
+                # (B, 1) * (B, T)
+
+                # (1,B) * (1,B)
+                unclipped = advantages * importance_ratio
+                # (1,B) * (1,B)
+                clipped = advantages * importance_ratio.clamp(1 - self.ctx.hparams.eps, 1 + self.ctx.hparams.eps)
+                # log_rank_0(f"{advantages.shape=}")
+                # log_rank_0(f"{clipped.shape=}")
+                # log_rank_0(f"{unclipped.shape=}")
+                clipped_surrogate = torch.minimum(unclipped, clipped)
+                # log_rank_0(f"{clipped_surrogate.shape=}")
+                # dist.breakpoint()
+
+                # 6. Next, we need to calculate the approximate KL penalty to the ref policy
+                # KL(policy_new || policy_ref) ~= policy_ref/policy_new - log(policyref/policy_new) - 1
+                dkl_approx = (ref_logprobs - new_logprobs).exp() - (ref_logprobs - new_logprobs) - 1
+                # log_rank_0(f"{ref_logprobs.shape=}")
+                # log_rank_0(f"{new_logprobs.shape=}")
+                # log_rank_0(f"{dkl_approx.shape=}")
+
+                # 7. Compute per-token loss L_GRPO = L_clip - L_kl
+                # compute the per-sample loss (loss for all samples is independent at this point)
+                assert dkl_approx.shape == clipped_surrogate.shape, f"{dkl_approx.shape=} != {clipped_surrogate.shape=}"
+                per_token_loss = clipped_surrogate - self.ctx.hparams.kl_penalty_strength * dkl_approx
+
+                # 8. Mask out all invalid logprobs that aren't from the GRPO rollouts
+                grpo_token_loss = per_token_loss * grpo_logit_mask.float()
+
+                # --- loss aggregation ---
+                # 9. Next, we average each batch by the **sequence length**, then we average by the group-size
+                # Warning: sequence-length averaging assigns greater weight to shorter sequences than longer ones
+                # but in our case this is fine, since we only care about an objective reward
+                # (B,) --> (B, 1)
+
+                # now we divide each token loss by the number of logprobs
+                # this achieves length averaging.
+                grpo_token_loss = grpo_token_loss / scalars.float()
+
+                # this should achieve the group average
+                grpo_sequence_loss = grpo_token_loss.sum(dim=-1) / batch_size
+                grpo_loss = -grpo_sequence_loss
+                # dist.breakpoint()
+
+                # backprop
+                grpo_loss.backward()
+
+                # we optimize the model
+                gradnorm = self.take_training_step()
                 log_rank_0(
-                    f"Inner Epoch {epoch + 1}/{ctx.hyperparams.inner_epochs} | "
+                    f"Step {self._training_step} | "
+                    f"Inner Epoch {epoch + 1}/{self.ctx.hparams.inner_epochs} | "
                     f"Loss: {grpo_loss.item() / dist.get_world_size():.4f} | "
                     f"Grad Norm: {gradnorm.item():.4f}"
                 )
-
-            dist.barrier()
+                dist.barrier()
 
 
 @app.command()
@@ -449,7 +502,6 @@ def train(
     ),
     # dataset parameters, we'll eventually move these to a data generation command
     train_path: str = typer.Option(..., "--train-path", help="Path to the training data"),
-    eval_path: str = typer.Option(None, "--eval-path", help="Path to the training data"),
     seed: int = typer.Option(67, help="Random seed"),
     num_problems: int = typer.Option(20, help="Number of problems"),
     min_num: int = typer.Option(-100, help="Minimum number for problems"),
@@ -479,6 +531,9 @@ def train(
     group_size: int = typer.Option(
         1, "-G", "--group-size", help="Group size / number of rollouts to generate from a single prompt"
     ),
+    ref_update_frequency: int = typer.Option(
+        -1, "--ref-update-frequency", help="The frequency (in steps) in which the reference policy is updated."
+    ),
     temperature: float = typer.Option(0.7, "-t", "--temp", help="sampling temperature"),
     clip_eps: float = typer.Option(0.1, "--clip-eps", help="epsilon used for GRPO clip"),
     kl_strength: float = typer.Option(1.0, "--kl", help="strength of the kl penalty to the reference policy"),
@@ -500,7 +555,7 @@ def train(
         vllm_url=vllm_url,
         vllm_model_name=vllm_model_name,
         vllm_model_dir=vllm_model_dir,
-        hyperparams=Hyperparameters(
+        hparams=Hyperparameters(
             lr=lr,
             max_seq_len=max_seq_len,
             batch_size=batch_size,
@@ -512,6 +567,7 @@ def train(
             kl_penalty_strength=kl_strength,
             adamw_betas=(beta1, beta2),
             adamw_wd=wd,
+            update_ref_policy_every_n_steps=ref_update_frequency,
         ),
         sampling_params=SamplingParams(
             max_new_tokens=max_new_tokens,
@@ -522,71 +578,15 @@ def train(
             repetition_penalty=1.0,
         ),
         output_dir=output_dir,
+        train_path=train_path,
+        eval_split=eval_split,
         world_size=dist.get_world_size(),
     )
+    trainer = GRPOTrainer(train_ctx)
 
-    # load the dataset
-    train_dataset, eval_dataset = ProblemDataset.from_jsonl(train_path, eval_split)
-    train_loader = create_distributed_data_loader(train_dataset, batch_size)
-    # Print dataset statistics
-    log.info(f"✓ Loaded {len(train_dataset)} training samples")
-    if eval_dataset:
-        log.info(f"✓ Loaded {len(eval_dataset)} evaluation samples")
-
-    # check if we need to write into output dir
-    if output_dir is not None and not train_ctx.valid_save_dir():
-        log.error(f"Cannot write to output directory '{output_dir}'")
-        raise typer.Exit(code=1)
-
-    # load models
-    train_ctx.load_models()
-    train_ctx.wrap_models_with_fsdp2()
-
-    # here we want to evaluate the model with vllm
-    if eval_dataset is not None and len(eval_dataset) > 0:
-        eval_model(eval_dataset, train_ctx)
-
-    # create the train dataloader
-
-    # now we iterate
-    for epoch in range(epochs):
-        pbar = tqdm(
-            train_loader,
-            desc=f"Epoch {epoch + 1}/{epochs}",
-            total=len(train_loader),
-        )
-        for batch in pbar:
-            # here we need to create a set of rollouts for each prompt
-            rollouts = simple_rollouts(
-                train_ctx,
-                batch,
-            )
-            dist.barrier()
-
-            # Calculate average reward for this batch
-            total_rewards = sum(rollout.score.reward for sample in rollouts for rollout in sample.rollouts)
-            total_rollouts = sum(len(sample.rollouts) for sample in rollouts)
-            avg_reward = total_rewards / total_rollouts if total_rollouts > 0 else 0.0
-
-            # Update tqdm postfix with average reward
-            pbar.set_postfix({"avg_reward": f"{avg_reward:.4f}"})
-
-            # now that we've generated G rollouts for our B groups of prompts,
-            # we convert this into a dataset and update the trainable policy on it
-            train_policy_on_rollouts(
-                rollouts,
-                train_ctx,
-            )
-            dist.barrier()
-
-        # evaluate the model
-        if eval_dataset is not None and len(eval_dataset) > 0:
-            eval_model(eval_dataset, train_ctx)
-        dist.barrier()
-
-        # save a checkpoint for the current epoch
-        # TODO: bring back real checkpointing
-        #  train_ctx.save_checkpoint(epoch)
+    dist.barrier()
+    trainer.initialize()
+    trainer.train()
 
     destroy_distributed_environment()
 
@@ -606,6 +606,9 @@ def orchestrator(
     group_size: int = typer.Option(16, "--group-size", help="Rollout size (num rollouts to generate/batch)"),
     inner_batch_size: int = typer.Option(18, "--inner-batch-size", help="Inner batch size for the GRPO update step"),
     epochs: int = typer.Option(10, "--epochs", help="Number of epochs"),
+    ref_update_frequency: int = typer.Option(
+        400, "--ref-update-frequency", help="The frequency (in steps) in which the reference policy is updated."
+    ),
 ):
     # # first load and write the model
     prepare_model(model_write_dir)
@@ -681,6 +684,8 @@ def orchestrator(
                 str(inner_batch_size),
                 "--epochs",
                 str(epochs),
+                "--ref-update-frequency",
+                str(ref_update_frequency),
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,

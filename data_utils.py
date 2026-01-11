@@ -284,6 +284,6 @@ def create_grpo_data_loader(
         dataset=ds,
         sampler=sampler,
         collate_fn=_collate_fn,
-        batch_size=ctx.hyperparams.inner_batch_size // dist.get_world_size(),
+        batch_size=ctx.hparams.inner_batch_size // dist.get_world_size(),
     )
     return train_loader
