@@ -722,7 +722,7 @@ class TrainingContext(pydantic.BaseModel):
 
     def policy_optimize_step(self) -> Tensor:
         # take an optimization step
-        gradnorm = torch.nn.utils.clip_grad_norm_(ctx.model.parameters(), 1.0)
+        gradnorm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
         self.optimizer.step()
         self._policy_has_changed = True
         self.optimizer.zero_grad()
