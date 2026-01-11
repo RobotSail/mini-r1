@@ -434,6 +434,8 @@ def train_policy_on_rollouts(samples: list[Sample], ctx: TrainingContext):
                     f"Grad Norm: {gradnorm.item():.4f}"
                 )
 
+            dist.barrier()
+
 
 @app.command()
 def train(
@@ -575,13 +577,16 @@ def train(
                 rollouts,
                 train_ctx,
             )
+            dist.barrier()
 
         # evaluate the model
         if eval_dataset is not None and len(eval_dataset) > 0:
             eval_model(eval_dataset, train_ctx)
+        dist.barrier()
 
         # save a checkpoint for the current epoch
-        train_ctx.save_checkpoint(epoch)
+        # TODO: bring back real checkpointing
+        #  train_ctx.save_checkpoint(epoch)
 
     destroy_distributed_environment()
 
@@ -600,6 +605,7 @@ def orchestrator(
     # batch_size: int = typer.Option(54, "--batch-size", help="Batch size (for generation)"),
     group_size: int = typer.Option(16, "--group-size", help="Rollout size (num rollouts to generate/batch)"),
     inner_batch_size: int = typer.Option(18, "--inner-batch-size", help="Inner batch size for the GRPO update step"),
+    epochs: int = typer.Option(10, "--epochs", help="Number of epochs"),
 ):
     # # first load and write the model
     prepare_model(model_write_dir)
@@ -673,6 +679,8 @@ def orchestrator(
                 str(group_size),
                 "--inner-batch-size",
                 str(inner_batch_size),
+                "--epochs",
+                str(epochs),
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
