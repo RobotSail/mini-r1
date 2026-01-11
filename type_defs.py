@@ -688,7 +688,7 @@ class TrainingContext(pydantic.BaseModel):
 
     async def _generate_completions(self, problems: list[Problem], n_completions: int = None, logprobs=True):
         # we structure it without condensing here to avoid GC issues
-        async with AsyncOpenAI(base_url=f"{self.vllm_url}/v1") as client:
+        async with AsyncOpenAI(base_url=f"{self.vllm_url}/v1", timeout=None) as client:
             tasks = [
                 self._generate_samples_for_problem(client, problem, n_samples=n_completions, include_logprobs=logprobs)
                 for problem in problems
@@ -733,6 +733,10 @@ class TrainingContext(pydantic.BaseModel):
         return gradnorm
 
     def save_checkpoint(self, suffix: str | None = None):
+        if not self.output_dir:
+            log_rank_0("no output dir provided, skipping checkpoint")
+            return
+
         save_dir = os.path.join(self.output_dir)
         if suffix:
             save_dir = os.path.join(self.output_dir, suffix)

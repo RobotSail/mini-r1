@@ -168,6 +168,12 @@ def eval(
 
 
 class GRPOTrainer:
+    """
+    GRPO Training class for mini R1.
+
+    TODO: move components from the TrainingContext object into here
+    """
+
     ctx: TrainingContext
     train_dataset: ProblemDataset
     eval_dataset: ProblemDataset
@@ -596,19 +602,29 @@ def stream_output(stream, prefix, file=sys.stdout):
         print(f"[{prefix}] {line.decode().rstrip()}", file=file, flush=True)
 
 
+# (32 x 16) = 512, (512 x 16) = 8192, (8192 / 8) = 1024, (1024 x 6) = 6,144, (6,144 / 16) = 384, (384 / 16) = 24
+# so batch size = 384
+# inner batch size (B) = 24
+# group size (G) = 16
+
+
 @app.command()
 def orchestrator(
     model_write_dir: str = "/dev/shm/mini-r1/current-model",
+    checkpoint_dir: str | None = typer.Option(None, "--checkpoint-dir", help="Directory to save the checkpoint in"),
     train_gpus: int = typer.Option(6, "--train-gpus", help="Num GPUs to be used for training"),
     vllm_gpus: int = typer.Option(2, "--vllm-gpus", help="Num GPUs to be used for the vLLM server"),
-    batch_size: int = typer.Option(288, "--batch-size", help="Batch size (for generation)"),
+    # batch_size: int = typer.Option(288, "--batch-size", help="Batch size (for generation)"),
     # batch_size: int = typer.Option(54, "--batch-size", help="Batch size (for generation)"),
+    # defaults are based on R1 Zero pipeline. R1 Zero used a batch size of 512, we have 6 GPUs so use 510
+    batch_size: int = typer.Option(384, "--batch-size", help="Batch size (for generation)"),
     group_size: int = typer.Option(16, "--group-size", help="Rollout size (num rollouts to generate/batch)"),
-    inner_batch_size: int = typer.Option(18, "--inner-batch-size", help="Inner batch size for the GRPO update step"),
+    inner_batch_size: int = typer.Option(24, "--inner-batch-size", help="Inner batch size for the GRPO update step"),
     epochs: int = typer.Option(10, "--epochs", help="Number of epochs"),
     ref_update_frequency: int = typer.Option(
         400, "--ref-update-frequency", help="The frequency (in steps) in which the reference policy is updated."
     ),
+    verbose_vllm: bool = typer.Option(False),
 ):
     # # first load and write the model
     prepare_model(model_write_dir)
@@ -631,25 +647,28 @@ def orchestrator(
 
     vllm_process, training_process = None, None
     try:
+        vllm_cmd = [
+            "vllm",
+            "serve",
+            model_write_dir,
+            "--enable-sleep-mode",
+            "--served-model-name",
+            served_name,
+            "--logprobs-mode",
+            "processed_logprobs",  # returned logprobs will have temp. scaling
+            "--port",
+            "8000",
+            # use 2 gpus for inference for right now
+            "--data-parallel-size",
+            str(vllm_gpus),
+            "--dtype",
+            "float16",
+        ]
+        if not verbose_vllm:
+            vllm_cmd += ["--disable-log-requests", "--uvicorn-log-level", "warning"]
         vllm_process = subprocess.Popen(
             # [sys.executable, "-m", "vllm.entrypoints.openai.api_server", "--model", model_write_dir, "--enable-sleep-mode"],
-            [
-                "vllm",
-                "serve",
-                model_write_dir,
-                "--enable-sleep-mode",
-                "--served-model-name",
-                served_name,
-                "--logprobs-mode",
-                "processed_logprobs",  # returned logprobs will have temp. scaling
-                "--port",
-                "8000",
-                # use 2 gpus for inference for right now
-                "--data-parallel-size",
-                str(vllm_gpus),
-                "--dtype",
-                "float16",
-            ],
+            vllm_cmd,
             env=vllm_env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,  # separate pipe for stderr
@@ -657,40 +676,40 @@ def orchestrator(
         )
 
         # launch training with captured output
+        train_cmd = [
+            "torchrun",
+            "--nproc-per-node",
+            str(train_gpus),
+            "cli.py",
+            "train",
+            "--train-path",
+            "generated_data/train.jsonl",
+            "--model-dir",
+            model_write_dir,
+            "--vllm-model-dir",
+            model_write_dir,
+            "--vllm-model-name",
+            served_name,
+            "--vllm-url",
+            "http://localhost:8000",
+            "--eval-split",
+            "0.25",
+            "--batch-size",
+            str(batch_size),
+            "--group-size",
+            str(group_size),
+            "--inner-batch-size",
+            str(inner_batch_size),
+            "--epochs",
+            str(epochs),
+            "--ref-update-frequency",
+            str(ref_update_frequency),
+        ]
+        if checkpoint_dir:
+            train_cmd += ["--output-dir", checkpoint_dir]
+
         training_process = subprocess.Popen(
-            [
-                "torchrun",
-                "--nproc-per-node",
-                str(train_gpus),
-                "cli.py",
-                "train",
-                "--train-path",
-                "generated_data/train.jsonl",
-                "--model-dir",
-                model_write_dir,
-                "--vllm-model-dir",
-                model_write_dir,
-                "--vllm-model-name",
-                served_name,
-                "--vllm-url",
-                "http://localhost:8000",
-                "--eval-split",
-                "0.25",
-                "--batch-size",
-                str(batch_size),
-                "--group-size",
-                str(group_size),
-                "--inner-batch-size",
-                str(inner_batch_size),
-                "--epochs",
-                str(epochs),
-                "--ref-update-frequency",
-                str(ref_update_frequency),
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            env=train_env,
-            bufsize=1,
+            train_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=train_env, bufsize=1
         )
 
         # stream stdout
