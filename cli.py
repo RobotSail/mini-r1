@@ -39,6 +39,7 @@ from src.distributed_packer import (
     create_distributed_grpo_dataloader,
     DistributedPackingSampler,
     PackedBatch,
+    AccumulationWindow,
 )
 from utils import display_scorecard, init_distributed, destroy_distributed_environment, log_rank_0
 from type_defs import (
@@ -152,16 +153,6 @@ def eval(
     )
 
     eval_data = eval_dataset.batch(eval_dataset.num_rows)
-
-    # samples = generate_rollouts(
-    #     model,
-    #     tokenizer,
-    #     batch=next(iter(eval_data)),
-    #     batch_size=eval_dataset.num_rows,
-    #     group_size=group_size,
-    #     sampling_params=sampling_params,
-    #     show_tqdm=True,
-    # )
 
     percent_scores = []
     for sample in samples:
@@ -299,6 +290,9 @@ class GRPOTrainer:
 
         This uses FFD packing with K-synchronization to ensure all ranks have
         exactly the same number of microbatches, preventing FSDP collective mismatches.
+
+        The dataloader groups microbatches into accumulation windows, where each window
+        contains K microbatches to accumulate before taking an optimizer step.
         """
         from functools import partial
 
@@ -308,13 +302,22 @@ class GRPOTrainer:
         # Create the JsonlDataset from samples
         ds = JsonlDataset(dataset=samples, pad_token_id=self.ctx.tokenizer.pad_token_id)
 
+        # Calculate accumulation steps: how many microbatches to process before optimizer.step()
+        # We want to accumulate roughly inner_batch_size samples per optimizer step
+        # Since we're using distributed training, divide by world size
+        world_size = dist.get_world_size()
+        accumulation_steps = max(1, self.ctx.hparams.inner_batch_size // world_size)
+
+        log_rank_0(f"Using {accumulation_steps} accumulation steps per optimizer update")
+
         # Use the distributed packing dataloader
-        # This ensures all ranks do exactly K microbatches
+        # This ensures all ranks do exactly K microbatches per accumulation window
         return create_distributed_grpo_dataloader(
             dataset=ds,
             max_tokens_per_rank=self.ctx.hparams.max_tokens_per_gpu,
             device=self.ctx.device,
             collate_fn=_collate_fn,
+            accumulation_steps=accumulation_steps,
             use_quadratic_cost=True,  # Better for attention-dominated workloads
             shuffle=False,  # Already randomized by rollout sampling
         )
@@ -414,25 +417,29 @@ class GRPOTrainer:
         self.ctx.model.train()
 
         # Create the distributed data loader with lockstep microbatches
-        # This generator ensures all ranks have exactly K microbatches
+        # This generator yields AccumulationWindow objects
         data_loader = list(self.create_grpo_data_loader(samples))
 
         # now we train
         for epoch in range(self.ctx.hparams.inner_epochs):
-            # Iterate through the microbatches
-            for packed_batch in data_loader:
-                packed_batch: PackedBatch
+            # Iterate through accumulation windows (each window = K microbatches)
+            for accum_window in data_loader:
+                accum_window: AccumulationWindow
 
-                # Handle padding batches - we still need to run forward/backward
-                # to keep FSDP collectives in sync, but we zero out the loss contribution
-                if packed_batch.is_padding:
-                    log_rank_0("padding microbatch - running dummy forward/backward for FSDP sync")
+                # Process K microbatches and accumulate gradients
+                for microbatch_idx, packed_batch in enumerate(accum_window.microbatches):
+                    packed_batch: PackedBatch
 
-                batch = packed_batch.batch
-                if batch is None:
-                    # Edge case: completely empty dataset
-                    dist.barrier()
-                    continue
+                    # Handle padding batches - we still need to run forward/backward
+                    # to keep FSDP collectives in sync, but we zero out the loss contribution
+                    if packed_batch.is_padding:
+                        log_rank_0("padding microbatch - running dummy forward/backward for FSDP sync")
+
+                    batch = packed_batch.batch
+                    if batch is None:
+                        # Edge case: completely empty dataset
+                        dist.barrier()
+                        continue
 
                 """
                 minibatch here has columns input_ids, labels, advantage. it is indexed column-first and row-second
@@ -574,19 +581,22 @@ class GRPOTrainer:
                 if packed_batch.is_padding:
                     grpo_loss = grpo_loss * 0.0
 
-                # backprop
+                # backprop (accumulate gradients)
                 grpo_loss.backward()
 
-                # we optimize the model
-                gradnorm = self.take_training_step()
+                # Log per-microbatch stats
                 if not packed_batch.is_padding:
                     log_rank_0(
-                        f"Step {self._training_step} | "
+                        f"Microbatch {microbatch_idx + 1}/{accum_window.num_accumulation_steps} | "
                         f"Inner Epoch {epoch + 1}/{self.ctx.hparams.inner_epochs} | "
-                        f"Loss: {grpo_loss.item() / dist.get_world_size():.4f} | "
-                        f"Grad Norm: {gradnorm.item():.4f}"
+                        f"Loss: {grpo_loss.item() / dist.get_world_size():.4f}"
                     )
-                dist.barrier()
+
+                # After processing all K microbatches in this window, take optimizer step
+                if microbatch_idx == len(accum_window.microbatches) - 1:
+                    gradnorm = self.take_training_step()
+                    log_rank_0(f"Optimizer Step {self._training_step} | Grad Norm: {gradnorm.item():.4f}")
+                    dist.barrier()
 
 
 @app.command()
@@ -727,9 +737,9 @@ def orchestrator(
     # batch_size: int = typer.Option(288, "--batch-size", help="Batch size (for generation)"),
     # batch_size: int = typer.Option(54, "--batch-size", help="Batch size (for generation)"),
     # defaults are based on R1 Zero pipeline. R1 Zero used a batch size of 512, we have 6 GPUs so use 510
-    batch_size: int = typer.Option(384, "--batch-size", help="Batch size (for generation)"),
+    batch_size: int = typer.Option(48, "--batch-size", help="Batch size (for generation)"),
     group_size: int = typer.Option(16, "--group-size", help="Rollout size (num rollouts to generate/batch)"),
-    inner_batch_size: int = typer.Option(24, "--inner-batch-size", help="Inner batch size for the GRPO update step"),
+    inner_batch_size: int = typer.Option(32, "--inner-batch-size", help="Inner batch size for the GRPO update step"),
     epochs: int = typer.Option(10, "--epochs", help="Number of epochs"),
     ref_update_frequency: int = typer.Option(
         400, "--ref-update-frequency", help="The frequency (in steps) in which the reference policy is updated."

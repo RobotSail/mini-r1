@@ -353,11 +353,22 @@ class PackedBatch:
     indices: list[int] = field(default_factory=list)
 
 
+@dataclass
+class AccumulationWindow:
+    """A group of microbatches to accumulate before taking an optimizer step."""
+    microbatches: list[PackedBatch]
+    num_accumulation_steps: int  # K for this window
+
+    def __len__(self):
+        return len(self.microbatches)
+
+
 def create_distributed_grpo_dataloader(
     dataset,
     max_tokens_per_rank: int,
     device: torch.device,
     collate_fn,
+    accumulation_steps: int | None = None,
     use_quadratic_cost: bool = True,
     shuffle: bool = False,
     seed: int = 42,
@@ -377,12 +388,15 @@ def create_distributed_grpo_dataloader(
         max_tokens_per_rank: Maximum tokens per microbatch per rank
         device: Torch device for distributed ops
         collate_fn: Collation function for batches
+        accumulation_steps: Number of microbatches to accumulate before optimizer step.
+                          If None, yields individual microbatches.
+                          If set, yields AccumulationWindow objects.
         use_quadratic_cost: Use L^2 as cost proxy
         shuffle: Whether to shuffle before packing
         seed: Random seed
 
     Returns:
-        Generator that yields PackedBatch objects
+        Generator that yields PackedBatch or AccumulationWindow objects
     """
     sampler = DistributedPackingSampler(
         dataset=dataset,
@@ -393,6 +407,8 @@ def create_distributed_grpo_dataloader(
         seed=seed,
     )
 
+    # Collect all microbatches
+    all_microbatches = []
     for batch_indices in sampler:
         if not batch_indices:
             # Padding batch - use the first item from dataset as a dummy
@@ -400,11 +416,34 @@ def create_distributed_grpo_dataloader(
             if len(dataset) > 0:
                 dummy_item = dataset[0]
                 batch = collate_fn([dummy_item])
-                yield PackedBatch(batch=batch, is_padding=True, indices=[])
+                all_microbatches.append(PackedBatch(batch=batch, is_padding=True, indices=[]))
             else:
-                yield PackedBatch(batch=None, is_padding=True, indices=[])
+                all_microbatches.append(PackedBatch(batch=None, is_padding=True, indices=[]))
         else:
             # Real batch
             items = [dataset[i] for i in batch_indices]
             batch = collate_fn(items)
-            yield PackedBatch(batch=batch, is_padding=False, indices=batch_indices)
+            all_microbatches.append(PackedBatch(batch=batch, is_padding=False, indices=batch_indices))
+
+    # If no accumulation, yield individual microbatches
+    if accumulation_steps is None:
+        for mb in all_microbatches:
+            yield mb
+    else:
+        # Group into accumulation windows
+        for i in range(0, len(all_microbatches), accumulation_steps):
+            window = all_microbatches[i:i+accumulation_steps]
+            # Handle last window: might have fewer than accumulation_steps
+            # Pad with dummy batches if needed to maintain lockstep
+            while len(window) < accumulation_steps:
+                if len(dataset) > 0:
+                    dummy_item = dataset[0]
+                    batch = collate_fn([dummy_item])
+                    window.append(PackedBatch(batch=batch, is_padding=True, indices=[]))
+                else:
+                    window.append(PackedBatch(batch=None, is_padding=True, indices=[]))
+
+            yield AccumulationWindow(
+                microbatches=window,
+                num_accumulation_steps=accumulation_steps
+            )
