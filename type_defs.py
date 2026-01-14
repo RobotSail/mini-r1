@@ -51,8 +51,7 @@ class VllmNotReady(BaseException):
 
 class Problem(pydantic.BaseModel):
     problem: str
-    answer: int
-    operation: str
+    answer: int | float
 
 
 class SamplingParams(pydantic.BaseModel):
@@ -60,7 +59,6 @@ class SamplingParams(pydantic.BaseModel):
     top_p: float = 1.0
     top_k: float = 0.0
     repetition_penalty: float = 1.0
-    max_tokens: int = 0
     max_new_tokens: int = 0
 
 
@@ -135,48 +133,67 @@ class RolloutResult(pydantic.BaseModel):
         # model's final answer
         return None if not parsed_nums else parsed_nums[-1]
 
+    @staticmethod
+    def format_reward(response: str) -> float:
+        # make sure that '<answer>' is the first part of the string
+        if not response.startswith("<think>"):
+            return 0
+
+        if response.startswith("<think>") and "</think>" not in response:
+            return 0
+
+        # first we make sure there was at least some thinking content
+        reward = 0.0
+        thoughts = think_pattern().findall(response)
+        if len(thoughts) < 1:
+            return 0.0
+
+        # check only the first thought
+        # small reward when it tries to think
+        if len(thoughts[0].strip()) > 0:
+            reward += 0.1
+
+        # check if answers exist
+        thinky_pieces = response.split("</think>")
+        post = thinky_pieces[-1]
+        answers = answer_pattern().findall(post)
+        if len(answers) == 1:
+            reward = 1.0
+
+        return reward
+
+    @classmethod
+    def accuracy_reward(cls, response: str, ground_truth: int | float):
+        answers = think_pattern().findall(response)
+        if len(answers) < 1:
+            return (0.0, False, False)
+
+        parsable = False
+        is_correct = False
+        assumed_answer = answers[-1]
+        try:
+            answer = cls.parse_number(assumed_answer)
+            parsable = True
+        except Exception:
+            acc_reward = 0.0
+        else:
+            is_correct = answer == ground_truth
+            acc_reward = 1.0 if is_correct else 0.0
+
+        return acc_reward, is_correct, parsable
+
     @classmethod
     def calculate_reward(cls, response: str, ground_truth: int | float) -> RolloutScore:
         # Defaults; if we cannot parse then it is not correct. If we can parse, it is not necessarily correct.
-        format_reward = 0.0
-        acc_reward = 0.0
-
-        # first pull the answers
-        matched_answers = answer_pattern().findall(response)
-        matched_thoughts: list[Any] = think_pattern().findall(response)
-
-        # format reward
-        if len(matched_thoughts) >= 1 and len(matched_answers) == 0:
-            # little reward for at least thinking
-            format_reward = 0.1
-
-        if len(matched_thoughts) >= 1 and len(matched_answers) >= 1:
-            # little bit more reward
-            format_reward = 0.2
-
-        if len(matched_thoughts) == len(matched_answers) == 1:
-            format_reward = 1.0
-
-        if len(matched_thoughts) == 0 and len(matched_answers) > 1:
-            # negative reward for no thinking
-            format_reward -= 0.1
-
-        # accuracy reward
-        if not matched_answers:
-            acc_reward = 0.0
-        else:
-            assumed_answer = matched_answers[-1]
-            try:
-                answer = cls.parse_number(assumed_answer)
-            except Exception:
-                acc_reward = 0.0
-            else:
-                acc_reward = 1.0 if answer == ground_truth else 0.0
+        format_reward = cls.format_reward(response)
+        acc_reward, is_correct, is_parsable = cls.accuracy_reward(response, ground_truth)
 
         return RolloutScore(
             reward=format_reward + acc_reward,
-            is_correct=acc_reward == 1.0,
-            is_parsable=format_reward == 1.0,
+            # todo: remove these
+            is_correct=is_correct,
+            is_parsable=is_parsable,
+            # is_correct=0.0,
         )
 
     # @classmethod
@@ -339,13 +356,20 @@ class Hyperparameters(pydantic.BaseModel):
     """
 
     lr: float
-    max_seq_len: int
+    msl_post: int
+    msl_pre: int
+    msl_jump_at_step: int
+    max_steps: int
     batch_size: int = 1
     group_size: int = 8
-    epochs: int
     inner_epochs: int = 1
     adamw_betas: tuple[float, float] = (0.9, 0.999)
     adamw_wd: float = 0.01
+
+    # packing length for training
+    max_tokens_per_gpu: int
+
+    # msl_pre: int =
 
     update_ref_policy_every_n_steps: int = -1  # off by default
 
@@ -381,7 +405,8 @@ class TrainingContext(pydantic.BaseModel):
     vllm_url: str
     vllm_model_name: str
     vllm_model_dir: str
-    train_path: str
+    dataset: str
+    train_path: str | None = None
     eval_split: float = 0.0
     output_dir: str | None = None
 
@@ -659,7 +684,12 @@ class TrainingContext(pydantic.BaseModel):
             time.sleep(3)
 
     async def _generate_samples_for_problem(
-        self, client: AsyncOpenAI, problem: Problem, n_samples: int, include_logprobs: bool
+        self,
+        client: AsyncOpenAI,
+        problem: Problem,
+        n_samples: int,
+        include_logprobs: bool,
+        max_seq_len: int,
     ) -> Sample:
         """
         Makes a call to the current policy to generate a sample from the given
@@ -671,8 +701,8 @@ class TrainingContext(pydantic.BaseModel):
             messages=messages,
             model=self.vllm_model_name,
             logprobs=include_logprobs,
-            max_tokens=self.sampling_params.max_tokens,
-            max_completion_tokens=self.sampling_params.max_new_tokens,
+            max_tokens=max_seq_len,
+            max_completion_tokens=max_seq_len,
             temperature=self.sampling_params.temperature,
             top_p=self.sampling_params.top_p,
             n=n_samples,
@@ -686,11 +716,15 @@ class TrainingContext(pydantic.BaseModel):
         )
         return Sample.from_chat_completion(problem, result)
 
-    async def _generate_completions(self, problems: list[Problem], n_completions: int = None, logprobs=True):
+    async def _generate_completions(
+        self, problems: list[Problem], max_seq_len: int, n_completions: int = None, logprobs=True
+    ):
         # we structure it without condensing here to avoid GC issues
         async with AsyncOpenAI(base_url=f"{self.vllm_url}/v1", timeout=None) as client:
             tasks = [
-                self._generate_samples_for_problem(client, problem, n_samples=n_completions, include_logprobs=logprobs)
+                self._generate_samples_for_problem(
+                    client, problem, n_samples=n_completions, include_logprobs=logprobs, max_seq_len=max_seq_len
+                )
                 for problem in problems
             ]
             return await asyncio.gather(*tasks)
@@ -700,6 +734,7 @@ class TrainingContext(pydantic.BaseModel):
         self,
         # TODO: replace with a more lightweight datatype
         problems: list[Problem],
+        max_seq_len: int,
         only_run_on_main=False,
         n_completions: int | None = None,
         include_logprobs: bool | None = None,
@@ -720,7 +755,9 @@ class TrainingContext(pydantic.BaseModel):
             results = []
         else:
             results = asyncio.run(
-                self._generate_completions(problems, n_completions=n_completions, logprobs=include_logprobs)
+                self._generate_completions(
+                    problems, max_seq_len, n_completions=n_completions, logprobs=include_logprobs
+                )
             )
         return results
 

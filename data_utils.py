@@ -3,20 +3,9 @@ import datasets
 import random
 from type_defs import (
     Problem,
-    SamplingParams,
-    Message,
-    TokenSample,
-    RolloutResult,
     Sample,
-    Sample,
-    TrainingContext,
 )
-from torch.utils.data import DataLoader, Dataset, RandomSampler
-from torch.utils.data import DistributedSampler
-import torch.distributed as dist
-
-from transformers import PreTrainedTokenizer
-from IPython import embed
+import re
 
 
 def random_problems(seed: int = 42, num_problems: int = 20, min_num: int = 1, max_num: int = 100) -> list[Problem]:
@@ -133,6 +122,7 @@ class JsonlDataset(torch.utils.data.Dataset):
         """
         item = self.dataset[idx]
         to_return = {
+            "seq_len": len(item["input_ids"]),
             "input_ids": torch.tensor(item["input_ids"], dtype=torch.long),
             # "logprob_ids": torch.tensor(item["logprob_ids"], dtype=torch.long),
             "logprobs": torch.tensor(item["logprobs"], dtype=torch.float32),
@@ -210,6 +200,34 @@ def collate_fn(batch: list[dict], pad_token_id: int):
     return final_item
 
 
+# so we need to be smart here,
+# every rank will have an identical amount of samples, but since we're going to be doing FFD batch packing,
+# with variable sequences, there is no guarantee that the actual amount of accumulation steps that need to be made
+# in each model's minibatches will be identical
+
+# since the datasets aren't synchronized, each rank will need to pack its own samples independently
+# and then share the number of microbatches with each other so that they can pack additional dummy batches
+# where needed
+
+# we need a flow like this:
+#
+# rank
+#  0                    ==>  D0                        ===> [[s1, s2], [s3]], ...                                [2, ...]
+#  1   ==> load_dataset ==>  D1  ==> calculate packing ===>  [[s1, s2, s3]]   ... ==> calculate num forwards ==> [1, ...]
+#  2                    ==>  D2                        ===> [[s1] [s2] [s3]], ...                                [3, ...]
+# ...
+# ---------------------------------------------------------------------------------------------
+# rank
+#  0  [2, ...]                                       [(1, 2)]
+#  1  [1, ...] ==> batches become samples w/ IDs ==> [(1, 1)] ==> ranks share their lists, global packer decides sample coupling
+#  2  [3, ...]                                       [(1, 3)]
+# ---------------------------------------------------------------------------------------------
+# rank
+#  0  [(1, 2), ...]                         [..., (1, 2), ...]
+#  1  [(1, 1), ...] samples are coupled ==> [(1, 1), ........] ==>
+#  2  [(1, 3), ...]                         [........, (1, 3)]
+
+
 class ProblemDataset(torch.utils.data.Dataset):
     def __init__(self, ds: datasets.Dataset):
         self.dataset = ds
@@ -221,7 +239,6 @@ class ProblemDataset(torch.utils.data.Dataset):
         item = self.dataset[index]
         return Problem(
             answer=item["answer"],
-            operation=item["operation"],
             problem=item["problem"],
         )
 
@@ -243,47 +260,38 @@ class ProblemDataset(torch.utils.data.Dataset):
 
         return (ProblemDataset(train_dataset), ProblemDataset(eval_dataset) if eval_dataset else None)
 
+    @classmethod
+    def from_gsm8k(cls, eval_split: float = 0.0, seed: int = 67):
+        ds = datasets.load_dataset("openai/gsm8k", name="main", split="train")
+
+        # convert it into the problem format
+        ds = ds.rename_columns({"question": "problem"})
+
+        def _get_answers(sample):
+            # gsm8k will produce the answers in the order needed to complete the problem,
+            # so the final entry in the match will be the problem answer
+            answers = re.findall("<<(.+)>>", sample["answer"])
+            alt_matches = re.findall("#### (.+)", sample["answer"])
+            if answers:
+                answer = answers[-1].split("=")[-1]  # format: '12*2=24', '8/2=4', etc
+            elif alt_matches:
+                answer = alt_matches[-1]
+            else:
+                raise ValueError("failed to find matching samples")
+
+            # this is the second format
+            return {"answer": float(answer.replace(",", ""))}
+
+        train_dataset = ds.map(_get_answers)
+        eval_dataset = None
+
+        if eval_split > 0:
+            dataset_dict = train_dataset.train_test_split(test_size=eval_split, seed=seed)
+            train_dataset = dataset_dict["train"]
+            eval_dataset = dataset_dict["test"]
+
+        return (ProblemDataset(train_dataset), ProblemDataset(eval_dataset) if eval_dataset else None)
+
 
 def problem_collate_fn(batch: list[Problem]) -> list[Problem]:
     return batch
-
-
-def create_distributed_data_loader(dataset, batch_size: int):
-    # so we're gonna get a dataset in a format like
-    # creates the distributed sampler
-    train_sampler = DistributedSampler(
-        dataset=dataset,
-        drop_last=True,
-        num_replicas=dist.get_world_size(),
-        rank=dist.get_rank(),  # this needs the global rank, so this is correct,
-        seed=67,
-        shuffle=True,
-    )
-    batchsize = batch_size // dist.get_world_size()
-
-    # we will fix eval later
-    return DataLoader(dataset, sampler=train_sampler, batch_size=batchsize, collate_fn=problem_collate_fn)
-
-
-def create_grpo_data_loader(
-    ctx: TrainingContext,
-    dataset: list[Sample],
-):
-    from functools import partial
-
-    _collate_fn = partial(collate_fn, pad_token_id=ctx.tokenizer.pad_token_id)
-
-    ds = JsonlDataset(dataset=dataset, pad_token_id=ctx.tokenizer.pad_token_id)
-    sampler = DistributedSampler(
-        ds,
-        dist.get_world_size(),
-        drop_last=True,
-        shuffle=True,
-    )
-    train_loader = DataLoader(
-        dataset=ds,
-        sampler=sampler,
-        collate_fn=_collate_fn,
-        batch_size=ctx.hparams.inner_batch_size // dist.get_world_size(),
-    )
-    return train_loader

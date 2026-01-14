@@ -1,4 +1,6 @@
 import sys
+from torch.utils.data import DataLoader, Dataset, RandomSampler
+from torch.utils.data import DistributedSampler
 import requests
 from transformers import GenerationConfig
 import json
@@ -26,9 +28,17 @@ from rich.logging import RichHandler
 from data_utils import (
     generate_dataset,
     # dataset_from_groups,
-    create_grpo_data_loader,
+    # create_grpo_data_loader,
+    JsonlDataset,
     ProblemDataset,
-    create_distributed_data_loader,
+    # create_distributed_data_loader,
+    problem_collate_fn,
+    collate_fn as grpo_collate_fn,
+)
+from src.distributed_packer import (
+    create_distributed_grpo_dataloader,
+    DistributedPackingSampler,
+    PackedBatch,
 )
 from utils import display_scorecard, init_distributed, destroy_distributed_environment, log_rank_0
 from type_defs import (
@@ -182,8 +192,10 @@ class GRPOTrainer:
     def __init__(self, ctx: TrainingContext):
         self.ctx = ctx
         # load the dataset
-        self.train_dataset, self.eval_dataset = ProblemDataset.from_jsonl(ctx.train_path, ctx.eval_split)
-        self.train_loader = create_distributed_data_loader(self.train_dataset, self.ctx.hparams.batch_size)
+        if ctx.dataset == "json":
+            self.train_dataset, self.eval_dataset = ProblemDataset.from_jsonl(ctx.train_path, ctx.eval_split)
+        elif ctx.dataset == "gsm8k":
+            self.train_dataset, self.eval_dataset = ProblemDataset.from_gsm8k(ctx.eval_split)
         self._training_step = 0
 
         # Print dataset statistics
@@ -201,17 +213,35 @@ class GRPOTrainer:
         self.ctx.load_models()
         self.ctx.wrap_models_with_fsdp2()
 
+        # Create the train loader now that distributed is initialized
+        self.train_loader = self._create_problem_data_loader(self.train_dataset, self.ctx.hparams.batch_size)
+
+    def _create_problem_data_loader(self, dataset: ProblemDataset, batch_size: int):
+        """Create a distributed data loader for the problem dataset (for rollout generation)."""
+        train_sampler = DistributedSampler(
+            dataset=dataset,
+            drop_last=True,
+            num_replicas=dist.get_world_size(),
+            rank=dist.get_rank(),
+            seed=67,
+            shuffle=True,
+        )
+        batchsize = batch_size // dist.get_world_size()
+        return DataLoader(dataset, sampler=train_sampler, batch_size=batchsize, collate_fn=problem_collate_fn)
+
     @torch.no_grad
-    def simple_rollouts(self, batch: list[Problem], is_eval=False, n_completions=None):
+    def simple_rollouts(self, batch: list[Problem], max_seq_len: int, is_eval=False, n_completions=None):
         log_rank_0("making call to update vLLM policy")
         self.ctx.update_vllm_policy()
         if not is_eval:
-            return self.ctx.generate_completions(batch)
+            return self.ctx.generate_completions(batch, max_seq_len=max_seq_len)
 
         kwargs = {}
         if n_completions is not None and n_completions > 0:
             kwargs["n_completions"] = n_completions
-        return self.ctx.generate_completions(batch, include_logprobs=False, only_run_on_main=True, **kwargs)
+        return self.ctx.generate_completions(
+            batch, max_seq_len=max_seq_len, include_logprobs=False, only_run_on_main=True, **kwargs
+        )
 
     @torch.no_grad
     def eval_model(self):
@@ -229,8 +259,13 @@ class GRPOTrainer:
         eval_problems = [prob for prob in self.eval_dataset]
 
         for npass in pass_at:
+            rollout_msl = (
+                self.ctx.hparams.msl_pre
+                if self._training_step < self.ctx.hparams.msl_jump_at_step
+                else self.ctx.hparams.msl_post
+            )
             # need to generate the whole dataset
-            samples = self.simple_rollouts(eval_problems, is_eval=True, n_completions=npass)
+            samples = self.simple_rollouts(eval_problems, max_seq_len=rollout_msl, is_eval=True, n_completions=npass)
 
             # now we go and determine the passing rate
             percent_scores = []
@@ -254,6 +289,35 @@ class GRPOTrainer:
             log.info(
                 f"Pass@{npass}: {percent_above_50:.1f}% above 50% | {percent_at_100:.1f}% at 100% (across {len(samples)} samples with {npass} rollout(s) each)"
             )
+
+    def create_grpo_data_loader(
+        self,
+        samples: list[Sample],
+    ):
+        """
+        Create a distributed data loader for GRPO training with lockstep microbatches.
+
+        This uses FFD packing with K-synchronization to ensure all ranks have
+        exactly the same number of microbatches, preventing FSDP collective mismatches.
+        """
+        from functools import partial
+
+        # Create the collate function with pad token
+        _collate_fn = partial(grpo_collate_fn, pad_token_id=self.ctx.tokenizer.pad_token_id)
+
+        # Create the JsonlDataset from samples
+        ds = JsonlDataset(dataset=samples, pad_token_id=self.ctx.tokenizer.pad_token_id)
+
+        # Use the distributed packing dataloader
+        # This ensures all ranks do exactly K microbatches
+        return create_distributed_grpo_dataloader(
+            dataset=ds,
+            max_tokens_per_rank=self.ctx.hparams.max_tokens_per_gpu,
+            device=self.ctx.device,
+            collate_fn=_collate_fn,
+            use_quadratic_cost=True,  # Better for attention-dominated workloads
+            shuffle=False,  # Already randomized by rollout sampling
+        )
 
     @torch.no_grad()
     def update_reference_policy(self):
@@ -296,56 +360,80 @@ class GRPOTrainer:
         self.eval_model()
 
         # now we iterate
-        for epoch in range(self.ctx.hparams.epochs):
-            pbar = tqdm(
-                self.train_loader,
-                desc=f"Epoch {epoch + 1}/{self.ctx.hparams.epochs}",
-                total=len(self.train_loader),
+        pbar = tqdm(
+            total=self.ctx.hparams.max_steps,
+            desc="Training",
+            initial=self._training_step,
+        )
+
+        train_iter = iter(self.train_loader)
+        while self._training_step < self.ctx.hparams.max_steps:
+            try:
+                batch = next(train_iter)
+            except StopIteration:
+                # Reset the iterator when we've exhausted the train_loader
+                train_iter = iter(self.train_loader)
+
+                # evaluate the model at the end of each pass through the dataset
+                self.eval_model()
+                dist.barrier()
+
+                # save a checkpoint
+                self.ctx.save_checkpoint(f"step_{self._training_step}")
+
+                batch = next(train_iter)
+
+            # here we need to create a set of rollouts for each prompt
+            rollout_msl = (
+                self.ctx.hparams.msl_pre
+                if self._training_step < self.ctx.hparams.msl_jump_at_step
+                else self.ctx.hparams.msl_post
             )
-            for batch in pbar:
-                # here we need to create a set of rollouts for each prompt
-                rollouts = self.simple_rollouts(batch)
-                dist.barrier()
-
-                # Calculate average reward for this batch
-                total_rewards = sum(rollout.score.reward for sample in rollouts for rollout in sample.rollouts)
-                total_rollouts = sum(len(sample.rollouts) for sample in rollouts)
-                avg_reward = total_rewards / total_rollouts if total_rollouts > 0 else 0.0
-
-                # Update tqdm postfix with average reward
-                pbar.set_postfix({"avg_reward": f"{avg_reward:.4f}"})
-
-                # now that we've generated G rollouts for our B groups of prompts,
-                # we convert this into a dataset and update the trainable policy on it
-                self.train_policy_on_rollouts(rollouts)
-                dist.barrier()
-
-            # evaluate the model
-            self.eval_model()
+            rollouts = self.simple_rollouts(batch, max_seq_len=rollout_msl)
             dist.barrier()
 
-            # save a checkpoint for the current epoch
-            # TODO: bring back real checkpointing
-            self.ctx.save_checkpoint(f"epoch_{epoch}")
+            # Calculate average reward for this batch
+            total_rewards = sum(rollout.score.reward for sample in rollouts for rollout in sample.rollouts)
+            total_rollouts = sum(len(sample.rollouts) for sample in rollouts)
+            avg_reward = total_rewards / total_rollouts if total_rollouts > 0 else 0.0
+
+            # Update tqdm postfix with average reward
+            pbar.set_postfix({"avg_reward": f"{avg_reward:.4f}", "step": self._training_step})
+
+            # now that we've generated G rollouts for our B groups of prompts,
+            # we convert this into a dataset and update the trainable policy on it
+            self.train_policy_on_rollouts(rollouts)
+            dist.barrier()
+
+            # Update progress bar after training step
+            pbar.update(1)
+
+        pbar.close()
 
     def train_policy_on_rollouts(self, samples: list[Sample]):
         self.ctx.model.train()
 
-        # we need to create a dataset here
-        # configure tokenizer first
-        # create the 'dataset'
-        data_loader = create_grpo_data_loader(self.ctx, samples)
-
-        # so then we need to create a dataset from the rollouts
-        # our dataset needs:
-        #  1. messages
-        #  2. advantage for rollout
-        #  3. logprobs
+        # Create the distributed data loader with lockstep microbatches
+        # This generator ensures all ranks have exactly K microbatches
+        data_loader = list(self.create_grpo_data_loader(samples))
 
         # now we train
         for epoch in range(self.ctx.hparams.inner_epochs):
-            # generate the random set
-            for batch in data_loader:
+            # Iterate through the microbatches
+            for packed_batch in data_loader:
+                packed_batch: PackedBatch
+
+                # Handle padding batches - we still need to run forward/backward
+                # to keep FSDP collectives in sync, but we zero out the loss contribution
+                if packed_batch.is_padding:
+                    log_rank_0("padding microbatch - running dummy forward/backward for FSDP sync")
+
+                batch = packed_batch.batch
+                if batch is None:
+                    # Edge case: completely empty dataset
+                    dist.barrier()
+                    continue
+
                 """
                 minibatch here has columns input_ids, labels, advantage. it is indexed column-first and row-second
                 """
@@ -480,19 +568,24 @@ class GRPOTrainer:
                 # this should achieve the group average
                 grpo_sequence_loss = grpo_token_loss.sum(dim=-1) / batch_size
                 grpo_loss = -grpo_sequence_loss
-                # dist.breakpoint()
+
+                # For padding batches, zero out the loss so it doesn't contribute to gradients
+                # We still run forward/backward to keep FSDP collectives in sync
+                if packed_batch.is_padding:
+                    grpo_loss = grpo_loss * 0.0
 
                 # backprop
                 grpo_loss.backward()
 
                 # we optimize the model
                 gradnorm = self.take_training_step()
-                log_rank_0(
-                    f"Step {self._training_step} | "
-                    f"Inner Epoch {epoch + 1}/{self.ctx.hparams.inner_epochs} | "
-                    f"Loss: {grpo_loss.item() / dist.get_world_size():.4f} | "
-                    f"Grad Norm: {gradnorm.item():.4f}"
-                )
+                if not packed_batch.is_padding:
+                    log_rank_0(
+                        f"Step {self._training_step} | "
+                        f"Inner Epoch {epoch + 1}/{self.ctx.hparams.inner_epochs} | "
+                        f"Loss: {grpo_loss.item() / dist.get_world_size():.4f} | "
+                        f"Grad Norm: {gradnorm.item():.4f}"
+                    )
                 dist.barrier()
 
 
@@ -507,21 +600,32 @@ def train(
         ..., "--vllm-model-dir", help="Directory where vLLM expects to reload the model from"
     ),
     # dataset parameters, we'll eventually move these to a data generation command
-    train_path: str = typer.Option(..., "--train-path", help="Path to the training data"),
+    train_path: str | None = typer.Option(None, "--train-path", help="Path to the training data"),
+    dataset: str = typer.Option(
+        "gsm8k",
+        "--dataset",
+        help="the dataset to use for training. Use 'json' for reading from local files in the 'problem'/'answer' format",
+    ),
     seed: int = typer.Option(67, help="Random seed"),
     num_problems: int = typer.Option(20, help="Number of problems"),
     min_num: int = typer.Option(-100, help="Minimum number for problems"),
     max_num: int = typer.Option(100, help="Maximum number for problems"),
     # model
     # training params
-    epochs: int = typer.Option(1, help="Number of training epochs"),
     max_new_tokens: int = typer.Option(128, help="The maximum number of new tokens that the model can generate."),
-    max_seq_len: int = typer.Option(
-        8192,
-        "--msl",
-        "--max-seq-len",
+    msl_post: int = typer.Option(
+        2**16,
         help="maximum length of the sequences that we work with",
     ),
+    msl_pre: int = typer.Option(
+        2**15,
+        help="maximum length of the sequences that we work with",
+    ),
+    max_tokens_per_gpu: int = typer.Option(
+        2**11, help="This is the maximum amount of tokens we can use at a time during training."
+    ),
+    max_steps: int = typer.Option(10400, help="Number of training epochs"),
+    msl_jump_at=typer.Option(8200, help="Number of training epochs"),
     # adamw parms
     lr: float = typer.Option(1e-5, "--lr", help="Learning rate"),
     beta1: float = typer.Option(0.9, help="Adam beta1 parameter"),
@@ -563,10 +667,12 @@ def train(
         vllm_model_dir=vllm_model_dir,
         hparams=Hyperparameters(
             lr=lr,
-            max_seq_len=max_seq_len,
+            max_steps=max_steps,
+            msl_post=msl_post,
+            msl_pre=msl_pre,
+            msl_jump_at_step=msl_jump_at,
             batch_size=batch_size,
             group_size=group_size,
-            epochs=epochs,
             inner_epochs=inner_epochs,
             inner_batch_size=inner_batch_size,
             eps=clip_eps,
@@ -574,11 +680,11 @@ def train(
             adamw_betas=(beta1, beta2),
             adamw_wd=wd,
             update_ref_policy_every_n_steps=ref_update_frequency,
+            max_tokens_per_gpu=max_tokens_per_gpu,
         ),
         sampling_params=SamplingParams(
-            max_new_tokens=max_new_tokens,
             temperature=temperature,
-            max_tokens=max_seq_len,
+            max_new_tokens=max_new_tokens,
             top_p=1.0,
             top_k=0.0,
             repetition_penalty=1.0,
@@ -587,6 +693,7 @@ def train(
         train_path=train_path,
         eval_split=eval_split,
         world_size=dist.get_world_size(),
+        dataset=dataset,
     )
     trainer = GRPOTrainer(train_ctx)
 
@@ -602,18 +709,21 @@ def stream_output(stream, prefix, file=sys.stdout):
         print(f"[{prefix}] {line.decode().rstrip()}", file=file, flush=True)
 
 
-# (32 x 16) = 512, (512 x 16) = 8192, (8192 / 8) = 1024, (1024 x 6) = 6,144, (6,144 / 16) = 384, (384 / 16) = 24
-# so batch size = 384
-# inner batch size (B) = 24
-# group size (G) = 16
-
-
 @app.command()
 def orchestrator(
     model_write_dir: str = "/dev/shm/mini-r1/current-model",
     checkpoint_dir: str | None = typer.Option(None, "--checkpoint-dir", help="Directory to save the checkpoint in"),
     train_gpus: int = typer.Option(6, "--train-gpus", help="Num GPUs to be used for training"),
     vllm_gpus: int = typer.Option(2, "--vllm-gpus", help="Num GPUs to be used for the vLLM server"),
+    use_olmo: bool = typer.Option(
+        False,
+        "--use-olmo",
+        help="Whether or not to use the Olmo 7B pretrained base (for replicating R1 zero)",
+        is_flag=True,
+    ),
+    model_path: str | None = typer.Option(
+        None, "--model-path", help="Path or name of the model to train with if not using olmo"
+    ),
     # batch_size: int = typer.Option(288, "--batch-size", help="Batch size (for generation)"),
     # batch_size: int = typer.Option(54, "--batch-size", help="Batch size (for generation)"),
     # defaults are based on R1 Zero pipeline. R1 Zero used a batch size of 512, we have 6 GPUs so use 510
@@ -624,10 +734,27 @@ def orchestrator(
     ref_update_frequency: int = typer.Option(
         400, "--ref-update-frequency", help="The frequency (in steps) in which the reference policy is updated."
     ),
+    msl_post: int = typer.Option(
+        2**12,
+        help="maximum length of the sequences that we work with",
+    ),
+    msl_pre: int = typer.Option(
+        2**11,
+        help="maximum length of the sequences that we work with",
+    ),
+    max_steps: int = typer.Option(10400, help="Number of training epochs"),
+    max_new_tokens: int = typer.Option(128, help="The maximum number of new tokens that the model can generate."),
+    msl_jump_at=typer.Option(8200, help="Number of training epochs"),
     verbose_vllm: bool = typer.Option(False),
 ):
     # # first load and write the model
-    prepare_model(model_write_dir)
+    if use_olmo:
+        prepare_model(model_write_dir, model_path, use_olmo)
+    elif model_path is None:
+        raise ValueError("--model-path must be specified if not using olmo")
+    else:
+        prepare_model(model_write_dir, model_path)
+
     served_name = "current-policy"
 
     vllm_env = os.environ.copy()
@@ -700,10 +827,20 @@ def orchestrator(
             str(group_size),
             "--inner-batch-size",
             str(inner_batch_size),
-            "--epochs",
+            "--inner-epochs",
             str(epochs),
             "--ref-update-frequency",
             str(ref_update_frequency),
+            "--msl-pre",
+            str(msl_pre),
+            "--msl-post",
+            str(msl_post),
+            "--max-steps",
+            str(max_steps),
+            "--msl-jump-at",
+            str(msl_jump_at),
+            "--max-new-tokens",
+            str(max_new_tokens),
         ]
         if checkpoint_dir:
             train_cmd += ["--output-dir", checkpoint_dir]
@@ -723,7 +860,7 @@ def orchestrator(
         training_process.wait()
 
     except Exception as e:
-        log_rank_0(f"encountered error while launching training jobs: {e.with_traceback()}")
+        log_rank_0(f"encountered error while launching training jobs: {e}")
     finally:
         # Clean up processes if they exist
         if vllm_process and vllm_process.poll() is None:
