@@ -12,6 +12,40 @@ def prepare_model(model_save_dir: str, model_name: str = None, use_olmo: bool = 
     """
     prepares the OLMO model for training
     """
+    if os.path.exists(model_save_dir):
+        # Guard against critical directories
+        abs_path = os.path.abspath(model_save_dir)
+        critical_dirs = [
+            "/",
+            "/home",
+            "/usr",
+            "/bin",
+            "/etc",
+            "/var",
+            "/sys",
+            "/proc",
+            "/dev",
+            "/boot",
+            "/lib",
+            "/lib64",
+            "/opt",
+            "/root",
+            "/sbin",
+            "/tmp",
+        ]
+
+        # Check if path is a critical directory or a parent of one
+        if abs_path in critical_dirs or abs_path == os.path.expanduser("~"):
+            raise ValueError(f"Refusing to remove critical directory: {abs_path}")
+
+        # Additional safety: ensure path has reasonable depth (not too close to root)
+        if abs_path.count(os.sep) < 2:
+            raise ValueError(f"Refusing to remove directory too close to root: {abs_path}")
+
+        import shutil
+
+        shutil.rmtree(model_save_dir)
+
     os.makedirs(model_save_dir, exist_ok=True)
 
     revision = None

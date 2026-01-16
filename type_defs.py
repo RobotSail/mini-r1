@@ -1,6 +1,14 @@
+from __future__ import annotations
+
+import copy
 import functools
 from datetime import timedelta
+from typing import TYPE_CHECKING
 from torch._tensor import Tensor
+import typing as t
+
+if TYPE_CHECKING:
+    from src.rewards import RewardFn
 import openai
 from torch.optim import AdamW
 import torch.distributed as dist
@@ -34,8 +42,6 @@ import time
 import asyncio
 from openai import AsyncOpenAI
 import openai.types.chat
-import re
-import functools
 
 from openai.types.chat.chat_completion import ChatCompletion
 
@@ -72,20 +78,21 @@ class TokenSample(pydantic.BaseModel):
     logprob: float
 
 
-@functools.lru_cache(maxsize=1)
-def answer_pattern() -> re.Pattern:
-    return re.compile(r"<answer>(.*?)</answer>", re.DOTALL | re.IGNORECASE)
-
-
-@functools.lru_cache(maxsize=1)
-def think_pattern() -> re.Pattern:
-    return re.compile(r"<think>(.*?)</think>", re.DOTALL | re.IGNORECASE)
-
-
 class RolloutScore(pydantic.BaseModel):
     is_parsable: bool = False
     is_correct: bool = False
     reward: float = 0.0
+
+
+class JsonlDatasetEntry(t.TypedDict):
+    input_ids: list[int]
+    logprobs: list[float]
+    grpo_mask: list[bool]
+    num_logprobs: int
+    advantage: float
+    logprob_ids: list[int]
+    is_delimiter: bool
+    is_padding: bool
 
 
 class RolloutResult(pydantic.BaseModel):
@@ -95,154 +102,17 @@ class RolloutResult(pydantic.BaseModel):
     score: RolloutScore | None = None
     advantage: float = 0.0
 
-    @staticmethod
-    def parse_number(text: str) -> int | float:
-        """Try to parse a string into a number which is assumed to been inside of the answer tags using the <answer>...</answer> format."""
-        try:
-            if not any(c.isdigit() for c in text):
-                raise ValueError(f"No digits found in answer tags: {text}.")
-            if "." in text:
-                return float(text)
-            else:
-                return int(text)
-
-        except ValueError as ve:
-            raise ValueError(f"Could not extract answer from field: {text} (invalid integer): {ve}.")
-
     @classmethod
-    def parse_answer(cls, response: str) -> int | float | None:
-        """
-        Returns None if answer cannot be parsed, else returns a number
-        """
+    def from_problem_completion(
+        cls,
+        problem: Problem,
+        choice: openai.types.chat.chat_completion.Choice,
+        reward_fn: "RewardFn | None" = None,
+    ):
+        from src.rewards import DEFAULT_REWARD_FN
 
-        pattern = answer_pattern()
-        matches = pattern.findall(response)
+        reward_fn = reward_fn or DEFAULT_REWARD_FN
 
-        # we only want 1 of these
-        parsed_nums: list[int | float] = []  #
-        for match in matches:  # this is already bad
-            try:
-                answer = cls.parse_number(match)
-            except Exception as e:
-                continue
-                # print(f"failed to parse text from answer tags: {e}")
-            else:
-                parsed_nums.append(answer)
-
-        # if we found several, we only assume the last match is the
-        # model's final answer
-        return None if not parsed_nums else parsed_nums[-1]
-
-    @staticmethod
-    def format_reward(response: str) -> float:
-        # make sure that '<answer>' is the first part of the string
-        if not response.startswith("<think>"):
-            return 0
-
-        if response.startswith("<think>") and "</think>" not in response:
-            return 0
-
-        # first we make sure there was at least some thinking content
-        reward = 0.0
-        thoughts = think_pattern().findall(response)
-        if len(thoughts) < 1:
-            return 0.0
-
-        # check only the first thought
-        # small reward when it tries to think
-        if len(thoughts[0].strip()) > 0:
-            reward += 0.1
-
-        # check if answers exist
-        thinky_pieces = response.split("</think>")
-        post = thinky_pieces[-1]
-        answers = answer_pattern().findall(post)
-        if len(answers) == 1:
-            reward = 1.0
-
-        return reward
-
-    @classmethod
-    def accuracy_reward(cls, response: str, ground_truth: int | float):
-        answers = think_pattern().findall(response)
-        if len(answers) < 1:
-            return (0.0, False, False)
-
-        parsable = False
-        is_correct = False
-        assumed_answer = answers[-1]
-        try:
-            answer = cls.parse_number(assumed_answer)
-            parsable = True
-        except Exception:
-            acc_reward = 0.0
-        else:
-            is_correct = answer == ground_truth
-            acc_reward = 1.0 if is_correct else 0.0
-
-        return acc_reward, is_correct, parsable
-
-    @classmethod
-    def calculate_reward(cls, response: str, ground_truth: int | float) -> RolloutScore:
-        # Defaults; if we cannot parse then it is not correct. If we can parse, it is not necessarily correct.
-        format_reward = cls.format_reward(response)
-        acc_reward, is_correct, is_parsable = cls.accuracy_reward(response, ground_truth)
-
-        return RolloutScore(
-            reward=format_reward + acc_reward,
-            # todo: remove these
-            is_correct=is_correct,
-            is_parsable=is_parsable,
-            # is_correct=0.0,
-        )
-
-    # @classmethod
-    # def calculate_reward(cls, response: str, ground_truth: int | float) -> RolloutScore:
-    #     # Defaults; if we cannot parse then it is not correct. If we can parse, it is not necessarily correct.
-    #     is_parsable = False
-    #     is_correct = False
-
-    #     # reset it here just for good measure
-    #     reward = 0
-
-    #     # check if the response has any answers at all
-    #     matches = answer_pattern().findall(response)
-
-    #     # we only want 1 of these
-    #     parsed_nums: list[int | float] = []  #
-    #     for match in matches:  # this is already bad
-    #         try:
-    #             answer = cls.parse_number(match)
-    #         except Exception as e:
-    #             # print(f"failed to parse text from answer tags: {e}")
-    #             continue
-    #         else:
-    #             parsed_nums.append(answer)
-
-    #     if len(parsed_nums) == 1:
-    #         answer = parsed_nums[0]
-    #         is_parsable = True
-    #         is_correct = ground_truth == answer
-    #     if len(parsed_nums) > 1:
-    #         reward -= 0.1
-    #     elif is_parsable:
-    #         # okay, we WANT the model to produce more answers like this
-    #         # but we don't want to overweight this or give sparse rewards
-    #         # so we will assign a reward here of +1
-    #         reward += 0.1
-
-    #     if is_correct:
-    #         reward += 1  # huge reward for getting it right
-
-    #     return RolloutScore(
-    #         is_correct=is_correct,
-    #         is_parsable=is_parsable,
-    #         reward=reward,
-    #         advantage=0.0,  # this we haven't calculated yet
-    #     )
-
-    @classmethod
-    def from_problem_completion(cls, problem: Problem, choice: openai.types.chat.chat_completion.Choice):
         logprobs = []
         if choice.logprobs is not None:
             logprobs = [
@@ -253,7 +123,7 @@ class RolloutResult(pydantic.BaseModel):
             response=choice.message.content,
             token_ids=choice.token_ids,
             logprobs=logprobs,
-            score=cls.calculate_reward(choice.message.content, problem.answer),
+            score=reward_fn(choice.message.content, problem.answer),
         )
 
 
@@ -392,6 +262,7 @@ class TrainingContext(pydantic.BaseModel):
     model_config = pydantic.ConfigDict(arbitrary_types_allowed=True)
 
     model_name: str
+    system_msg: str | None = None
     output_dir: str | None = None
     optimizer: torch.optim.Optimizer | None = None
     model: PreTrainedModel | None = None
@@ -432,10 +303,18 @@ class TrainingContext(pydantic.BaseModel):
         # initialize model
         self.model = AutoModelForCausalLM.from_pretrained(self.model_name, attn_implementation="flash_attention_2")
 
-        # this is a frozen mdel which we do not update
-        self.ref_model = AutoModelForCausalLM.from_pretrained(self.model_name, attn_implementation="flash_attention_2")
+        # this is a frozen model which we do not update
+        # Use deepcopy to ensure truly independent weights (HF caching can cause tensor aliasing)
+        self.ref_model = copy.deepcopy(self.model)
         self.ref_model.eval()
         self.ref_model.requires_grad_(False)
+
+        # Debug: Verify models have independent parameters before FSDP wrapping
+        model_param = next(self.model.parameters())
+        ref_param = next(self.ref_model.parameters())
+        same_storage = model_param.data_ptr() == ref_param.data_ptr()
+        log_rank_0(f"DEBUG: Before FSDP - params share storage: {same_storage}, "
+                   f"model_ptr={model_param.data_ptr()}, ref_ptr={ref_param.data_ptr()}")
         self.tokenizer: Qwen2Tokenizer = AutoTokenizer.from_pretrained(self.model_name)
 
         # align tokenizer and tokens
@@ -448,14 +327,14 @@ class TrainingContext(pydantic.BaseModel):
                 )
 
         self.optimizer = AdamW(
-            self.model.parameters(),
+            params=self.model.parameters(),
             lr=self.hparams.lr,
             betas=self.hparams.adamw_betas,
             weight_decay=self.hparams.adamw_wd,
         )
 
     def create_device_mesh(self):
-        self.device_mesh = init_device_mesh("cuda", mesh_shape=(self.world_size), mesh_dim_names=("fsdp",))
+        self.device_mesh = init_device_mesh("cuda", mesh_shape=(self.world_size,), mesh_dim_names=("fsdp",))
 
     def wrap_models_with_fsdp2(self):
         mp_training_policy = MixedPrecisionPolicy(
@@ -503,6 +382,13 @@ class TrainingContext(pydantic.BaseModel):
                 reshard_after_forward=True,
             )
         fully_shard(self.ref_model, mesh=self.device_mesh, mp_policy=ref_mp_policy, reshard_after_forward=True)
+
+        # Debug: Verify models have independent parameters after FSDP wrapping
+        model_param = next(self.model.parameters())
+        ref_param = next(self.ref_model.parameters())
+        same_storage = model_param.data_ptr() == ref_param.data_ptr()
+        log_rank_0(f"DEBUG: After FSDP - params share storage: {same_storage}, "
+                   f"model_ptr={model_param.data_ptr()}, ref_ptr={ref_param.data_ptr()}")
 
     @requires_vllm_ready
     def update_vllm_policy(self):
@@ -697,6 +583,8 @@ class TrainingContext(pydantic.BaseModel):
         """
         # eval might only want to get a few
         messages = [{"role": "user", "content": problem.problem}]
+        if self.system_msg:
+            messages = [{"role": "system", "content": self.system_msg}] + messages
         result = await client.chat.completions.create(
             messages=messages,
             model=self.vllm_model_name,

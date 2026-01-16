@@ -16,6 +16,7 @@ dependencies = [
     "openai>=2.14.0",
     "typer>=0.21.0",
     "vllm>=0.13.0",
+    "wandb>=0.19.0",
 ]
 
 [project.optional-dependencies]
@@ -26,3 +27,23 @@ no-build-isolation-package = ["flash-attn"]
 
 [tool.uv.extra-build-dependencies]
 cuda = [{ requirement = "torch", match-runtime = true }]
+
+# we need to exclude all of these directories otherwise the tool tries to
+# load all of them and crashes the server!
+[tool.basedpyright]
+exclude = [
+    "**/__pycache__",
+    "**/.venv",
+    ".venv",
+    "**/wandb",
+    "**/generated_data",
+    "**/.vscode",
+    "**/test-saved-model",
+    "**/*.ipynb"
+]
+ignore = [
+    ".venv/**",
+    "**/.venv/**"
+]
+typeCheckingMode = "basic"
+useLibraryCodeForTypes = false

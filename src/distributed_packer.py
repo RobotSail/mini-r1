@@ -18,11 +18,13 @@ from dataclasses import dataclass, field
 from typing import Sequence
 import torch
 import torch.distributed as dist
+from src.data_utils import JsonlDataset
 
 
 @dataclass
 class Bin:
     """A bin containing sequence indices with bounded total cost."""
+
     indices: list[int] = field(default_factory=list)
     total_cost: int = 0
     total_tokens: int = 0
@@ -145,7 +147,9 @@ def split_bin(bin_: Bin, lengths: Sequence[int], max_tokens: int, use_quadratic_
     return bin1, bin2
 
 
-def split_bins_to_reach_k(bins: list[Bin], k: int, lengths: Sequence[int], max_tokens: int, use_quadratic_cost: bool = True) -> list[Bin]:
+def split_bins_to_reach_k(
+    bins: list[Bin], k: int, lengths: Sequence[int], max_tokens: int, use_quadratic_cost: bool = True
+) -> list[Bin]:
     """
     Split the heaviest bins until we have exactly k bins.
 
@@ -266,7 +270,7 @@ class DistributedPackingSampler:
 
     def __init__(
         self,
-        dataset,
+        dataset: JsonlDataset,
         max_tokens_per_rank: int,
         device: torch.device,
         use_quadratic_cost: bool = True,
@@ -348,6 +352,7 @@ class DistributedPackingSampler:
 @dataclass
 class PackedBatch:
     """A batch with metadata about whether it's a padding batch."""
+
     batch: dict | None
     is_padding: bool = False
     indices: list[int] = field(default_factory=list)
@@ -356,6 +361,7 @@ class PackedBatch:
 @dataclass
 class AccumulationWindow:
     """A group of microbatches to accumulate before taking an optimizer step."""
+
     microbatches: list[PackedBatch]
     num_accumulation_steps: int  # K for this window
 
@@ -364,7 +370,7 @@ class AccumulationWindow:
 
 
 def create_distributed_grpo_dataloader(
-    dataset,
+    dataset: JsonlDataset,
     max_tokens_per_rank: int,
     device: torch.device,
     collate_fn,
@@ -413,12 +419,9 @@ def create_distributed_grpo_dataloader(
         if not batch_indices:
             # Padding batch - use the first item from dataset as a dummy
             # This ensures FSDP collectives still work
-            if len(dataset) > 0:
-                dummy_item = dataset[0]
-                batch = collate_fn([dummy_item])
-                all_microbatches.append(PackedBatch(batch=batch, is_padding=True, indices=[]))
-            else:
-                all_microbatches.append(PackedBatch(batch=None, is_padding=True, indices=[]))
+            dummy_item = dataset._create_empty_entry()
+            batch = collate_fn([dummy_item])
+            all_microbatches.append(PackedBatch(batch=batch, is_padding=True, indices=[]))
         else:
             # Real batch
             items = [dataset[i] for i in batch_indices]
@@ -432,7 +435,7 @@ def create_distributed_grpo_dataloader(
     else:
         # Group into accumulation windows
         for i in range(0, len(all_microbatches), accumulation_steps):
-            window = all_microbatches[i:i+accumulation_steps]
+            window = all_microbatches[i : i + accumulation_steps]
             # Handle last window: might have fewer than accumulation_steps
             # Pad with dummy batches if needed to maintain lockstep
             while len(window) < accumulation_steps:
@@ -443,7 +446,4 @@ def create_distributed_grpo_dataloader(
                 else:
                     window.append(PackedBatch(batch=None, is_padding=True, indices=[]))
 
-            yield AccumulationWindow(
-                microbatches=window,
-                num_accumulation_steps=accumulation_steps
-            )
+            yield AccumulationWindow(microbatches=window, num_accumulation_steps=accumulation_steps)
