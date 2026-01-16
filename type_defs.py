@@ -17,7 +17,7 @@ import torch
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 import os
-from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard, FullyShardedDataParallel
+from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard, FullyShardedDataParallel, CPUOffloadPolicy
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper as ptd_checkpoint_wrapper,
 )
@@ -272,6 +272,7 @@ class TrainingContext(pydantic.BaseModel):
     device: torch.device = pydantic.Field(default_factory=lambda: torch.device("cuda", int(os.environ["LOCAL_RANK"])))
     sampling_params: SamplingParams
     device_mesh: DeviceMesh | None = None  # this will start out being none
+    ref_model_cpu_offload: bool = False  # CPU offload for ref model to save GPU memory
     world_size: int
     vllm_url: str
     vllm_model_name: str
@@ -304,17 +305,15 @@ class TrainingContext(pydantic.BaseModel):
         self.model = AutoModelForCausalLM.from_pretrained(self.model_name, attn_implementation="flash_attention_2")
 
         # this is a frozen model which we do not update
-        # Use deepcopy to ensure truly independent weights (HF caching can cause tensor aliasing)
-        self.ref_model = copy.deepcopy(self.model)
+        # Load fresh copy - use force_download or different approach to avoid any sharing
+        self.ref_model = AutoModelForCausalLM.from_pretrained(
+            self.model_name,
+            attn_implementation="flash_attention_2",
+        )
         self.ref_model.eval()
         self.ref_model.requires_grad_(False)
 
         # Debug: Verify models have independent parameters before FSDP wrapping
-        model_param = next(self.model.parameters())
-        ref_param = next(self.ref_model.parameters())
-        same_storage = model_param.data_ptr() == ref_param.data_ptr()
-        log_rank_0(f"DEBUG: Before FSDP - params share storage: {same_storage}, "
-                   f"model_ptr={model_param.data_ptr()}, ref_ptr={ref_param.data_ptr()}")
         self.tokenizer: Qwen2Tokenizer = AutoTokenizer.from_pretrained(self.model_name)
 
         # align tokenizer and tokens
@@ -325,13 +324,6 @@ class TrainingContext(pydantic.BaseModel):
                     f"model '{self.model_name}' doesn't have a pad_token_id, setting it to {self.tokenizer.pad_token_id}",
                     fg=typer.colors.BRIGHT_BLUE,
                 )
-
-        self.optimizer = AdamW(
-            params=self.model.parameters(),
-            lr=self.hparams.lr,
-            betas=self.hparams.adamw_betas,
-            weight_decay=self.hparams.adamw_wd,
-        )
 
     def create_device_mesh(self):
         self.device_mesh = init_device_mesh("cuda", mesh_shape=(self.world_size,), mesh_dim_names=("fsdp",))
@@ -367,28 +359,52 @@ class TrainingContext(pydantic.BaseModel):
             )
         fully_shard(self.model, mesh=self.device_mesh, mp_policy=mp_training_policy, reshard_after_forward=False)
 
-        # now wrap each module with fsdp2
+        # Wrap ref_model with FSDP for memory efficiency
+        # Note: Optimizer must be created AFTER this to avoid stale parameter references
         layers = self.ref_model.model.layers
         ref_mp_policy = MixedPrecisionPolicy(
-            param_dtype=torch.bfloat16,  # training model needs more range due to activations
+            param_dtype=torch.bfloat16,
             reduce_dtype=torch.float32,
         )
-        # this model is purely for inference, so we always reshard
+        # Optional CPU offload for ref model - keeps params on CPU, loads to GPU during forward
+        ref_offload_policy = CPUOffloadPolicy(pin_memory=True) if self.ref_model_cpu_offload else None
+        if self.ref_model_cpu_offload:
+            log_rank_0("Using CPU offload for reference model")
+
         for idx, block in enumerate(layers):
             fully_shard(
                 block,
                 mesh=self.device_mesh,
                 mp_policy=ref_mp_policy,
+                offload_policy=ref_offload_policy,
                 reshard_after_forward=True,
             )
-        fully_shard(self.ref_model, mesh=self.device_mesh, mp_policy=ref_mp_policy, reshard_after_forward=True)
+        fully_shard(
+            self.ref_model,
+            mesh=self.device_mesh,
+            mp_policy=ref_mp_policy,
+            offload_policy=ref_offload_policy,
+            reshard_after_forward=True,
+        )
 
         # Debug: Verify models have independent parameters after FSDP wrapping
         model_param = next(self.model.parameters())
         ref_param = next(self.ref_model.parameters())
-        same_storage = model_param.data_ptr() == ref_param.data_ptr()
-        log_rank_0(f"DEBUG: After FSDP - params share storage: {same_storage}, "
-                   f"model_ptr={model_param.data_ptr()}, ref_ptr={ref_param.data_ptr()}")
+        # Check if they're the same tensor object
+        same_object = model_param is ref_param
+        # Check if values are identical (they should be at init, but diverge after training)
+        values_equal = torch.equal(model_param, ref_param)
+        log_rank_0(f"DEBUG: After FSDP - same_object: {same_object}, values_equal: {values_equal}")
+
+        # Create optimizer AFTER FSDP wrapping - this is critical!
+        # See https://github.com/pytorch/pytorch/issues/149205
+        self.optimizer = AdamW(
+            params=self.model.parameters(),
+            lr=self.hparams.lr,
+            betas=self.hparams.adamw_betas,
+            weight_decay=self.hparams.adamw_wd,
+        )
+        log_rank_0("Optimizer created after FSDP wrapping")
 
     @requires_vllm_ready
     def update_vllm_policy(self):

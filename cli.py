@@ -827,6 +827,9 @@ def train(
     ref_update_frequency: int = typer.Option(
         -1, "--ref-update-frequency", help="The frequency (in steps) in which the reference policy is updated."
     ),
+    ref_cpu_offload: bool = typer.Option(
+        False, "--ref-cpu-offload", help="CPU offload for reference model to save GPU memory", is_flag=True
+    ),
     temperature: float = typer.Option(0.7, "-t", "--temp", help="sampling temperature"),
     clip_eps: float = typer.Option(0.1, "--clip-eps", help="epsilon used for GRPO clip"),
     kl_strength: float = typer.Option(0.01, "--kl", help="strength of the kl penalty to the reference policy"),
@@ -916,6 +919,7 @@ def train(
         eval_split=eval_split,
         world_size=dist.get_world_size(),
         dataset=dataset,
+        ref_model_cpu_offload=ref_cpu_offload,
     )
     trainer = GRPOTrainer(train_ctx)
 
@@ -984,6 +988,9 @@ def orchestrator(
         help="Reward function to use. Options: math_with_thinking, accuracy_only, format_only, strict_format_with_accuracy, gsm8k",
     ),
     lr: float = typer.Option(1e-5, "--lr", help="Learning rate to use during training"),
+    ref_cpu_offload: bool = typer.Option(
+        False, "--ref-cpu-offload", help="CPU offload for reference model to save GPU memory", is_flag=True
+    ),
 ):
     # # first load and write the model
     if use_olmo:
@@ -1090,6 +1097,8 @@ def orchestrator(
             train_cmd += ["--output-dir", checkpoint_dir]
         if system_msg:
             train_cmd += ["--system-msg", system_msg]
+        if ref_cpu_offload:
+            train_cmd += ["--ref-cpu-offload"]
 
         training_process = subprocess.Popen(
             train_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=train_env, bufsize=1
