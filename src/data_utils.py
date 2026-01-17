@@ -8,7 +8,6 @@ import re
 import torch.distributed as dist
 from torch.utils.data import Sampler, DataLoader, BatchSampler
 import numpy as np
-from src.batch_packer import batch_lengths_to_minibatches_lpt
 import functools
 
 
@@ -78,7 +77,7 @@ class JsonlDataset(torch.utils.data.Dataset):
         """
         return {
             "input_ids": [self.pad_token_id],
-            "logprobs": [1.0],
+            "logprobs": [0.0],
             "grpo_mask": [False],
             "num_logprobs": 0,
             "advantage": 0.0,
@@ -98,6 +97,9 @@ class JsonlDataset(torch.utils.data.Dataset):
         self.dataset = []
         self.pad_token_id = pad_token_id
 
+        # Diagnostic: track advantage statistics during dataset creation
+        all_advantages = []
+
         # we must flatten the batch
         for sample in dataset:
             # these are the prompt input IDs
@@ -107,21 +109,38 @@ class JsonlDataset(torch.utils.data.Dataset):
                 if not rollout.logprobs:
                     continue
 
+                # DIAGNOSTIC: Verify token_ids match logprob tokens
+                # logprob_token_ids = [lp.token for lp in rollout.logprobs]
+                # if len(rollout.token_ids) != len(logprob_token_ids):
+                #     print(f"[DATASET DEBUG] LENGTH MISMATCH: token_ids={len(rollout.token_ids)} vs logprob_tokens={len(logprob_token_ids)}")
+                # else:
+                #     mismatches = [(i, tid, lptid) for i, (tid, lptid) in enumerate(zip(rollout.token_ids, logprob_token_ids)) if tid != lptid]
+                #     if mismatches:
+                #         print(f"[DATASET DEBUG] TOKEN ID MISMATCH at {len(mismatches)}/{len(rollout.token_ids)} positions:")
+                #         for i, tid, lptid in mismatches[:10]:  # Show first 10
+                #             print(f"  Position {i}: token_ids[{i}]={tid} != logprob.token={lptid}")
+                #     else:
+                #         print(f"[DATASET DEBUG] All {len(rollout.token_ids)} token IDs match between token_ids and logprobs ✓")
+
                 # this should be good enough
                 input_ids = prompt_input_ids[:] + rollout.token_ids[:]
                 grpo_mask = [False] * len(prompt_input_ids) + [True] * len(rollout.token_ids[:])
-                logprobs_seq = [1.0] * len(prompt_input_ids) + [lp.logprob for lp in rollout.logprobs]
+                logprobs_seq = [0.0] * len(prompt_input_ids) + [lp.logprob for lp in rollout.logprobs]
 
                 # now we shift so offset is correct and we predict causal
-                grpo_mask = grpo_mask[1:]
-                logprobs_seq = logprobs_seq[1:]
-                input_ids = input_ids[:-1]
-                num_logprobs = len(rollout.logprobs)
+                # Suppose our input was "The Cat" and model generated "Sat Down EOS"
+                input_ids = input_ids[
+                    :-1
+                ]  #      ['The', 'Cat', 'Sat', 'Down', 'EOS']  --> ['The', 'Cat', 'Sat', 'Down']
 
-                # account for shift
+                # Creates a sequence of           [PAD,   'Sat', 'Down', 'EOS']
                 logprob_tokens: list[int] = [pad_token_id] * len(prompt_input_ids[1:]) + [
                     lp.token for lp in rollout.logprobs
                 ]
+                grpo_mask = grpo_mask[1:]  # [False, False, True, True, True]       --> [False, True, True, True]
+                logprobs_seq = logprobs_seq[1:]  # [1.0,   1.0,   0.35,  0.93,  0.23]   --> [1.0, 0.35, 0.93, 0.23]
+                num_logprobs = len(rollout.logprobs)  # produces 3
+
                 assert len(logprob_tokens) == len(logprobs_seq)
 
                 self.dataset.append(
@@ -183,9 +202,106 @@ class JsonlDataset(torch.utils.data.Dataset):
         return to_return
 
 
+# @dataclass
+# class DataCollatorWithFlattening(DefaultDataCollator):
+#     """
+#     Data collator used for padding free approach. Does the following:
+
+#     - concatenates the entire mini batch into single long sequence of shape [1, total_tokens]
+#     - uses `separator_id` to separate sequences within the concatenated `labels`, default value is -100
+#     - no padding will be added, returns `input_ids`, `labels` and `position_ids` by default
+#     - optionally returns the kwargs contained in FlashAttentionKwargs
+#     - optionally returns seq_idx indicating which sequence each token belongs to
+
+#     <Tip warning={true}>
+
+#     Using `DataCollatorWithFlattening` will flatten the entire mini batch into single long sequence.
+#     Make sure your attention computation is able to handle it!
+
+#     </Tip>
+#     """
+
+#     def __init__(
+#         self,
+#         *args,
+#         return_position_ids=True,
+#         separator_id=-100,
+#         return_flash_attn_kwargs=False,
+#         return_seq_idx=False,
+#         **kwargs,
+#     ):
+#         super().__init__(*args, **kwargs)
+#         self.return_position_ids = return_position_ids
+#         self.separator_id = separator_id
+#         self.return_flash_attn_kwargs = return_flash_attn_kwargs
+#         self.return_seq_idx = return_seq_idx
+#         self._int_64_keys = {"labels", "position_ids", "input_ids"}
+#         self._batch_dim_keys = {"labels", "position_ids", "input_ids", "seq_idx"}
+#         self._py_int_keys = {"max_length_q", "max_length_k"}
+
+#     def __call__(self, features, return_tensors=None, separator_id=None):
+#         if return_tensors is None:
+#             return_tensors = self.return_tensors
+#         if separator_id is None:
+#             separator_id = self.separator_id
+#         is_labels_provided = "labels" in features[0]
+#         batch = {"input_ids": [], "labels": []}
+#         if self.return_position_ids:
+#             batch.update({"position_ids": []})
+#         if self.return_seq_idx:
+#             batch.update({"seq_idx": []})
+#         if self.return_flash_attn_kwargs:
+#             cu_seq_lens = [0]
+#             max_length = 0
+#         for seq_idx, sample in enumerate(features):
+#             input_ids = sample["input_ids"]
+#             batch["input_ids"] += input_ids
+#             if is_labels_provided:
+#                 batch["labels"] += [separator_id] + sample["labels"][1:]
+#             else:
+#                 batch["labels"] += [separator_id] + input_ids[1:]
+#             if self.return_position_ids:
+#                 batch["position_ids"] += list(range(len(input_ids)))
+#             if self.return_seq_idx:
+#                 batch["seq_idx"] += [seq_idx for _ in range(len(input_ids))]
+#             if self.return_flash_attn_kwargs:
+#                 cu_seq_lens.append(cu_seq_lens[-1] + len(input_ids))
+#                 max_length = max(max_length, len(input_ids))
+
+#         if self.return_flash_attn_kwargs:
+#             batch["cu_seq_lens_q"] = batch["cu_seq_lens_k"] = cu_seq_lens
+#             batch["max_length_q"] = batch["max_length_k"] = max_length
+
+#         # FlashAttentionKwargs and seq_idx are expected to be int32s.
+#         if return_tensors == "pt":
+#             import torch
+
+#             data_cls = torch.tensor
+#             dtype_64 = torch.int64
+#             dtype_32 = torch.int32
+#         elif return_tensors == "np":
+#             data_cls = np.array
+#             dtype_64 = np.int64
+#             dtype_32 = np.int32
+#         else:
+#             raise ValueError(f'return_tensors must be one of ("pt", "np"), {return_tensors=} not supported')
+
+#         for k, v in batch.items():
+#             if k in self._batch_dim_keys:
+#                 v = [v]
+#             # Flash attention max_len_{q,k} are python ints
+#             if k not in self._py_int_keys:
+#                 batch[k] = data_cls(v, dtype=dtype_64 if k in self._int_64_keys else dtype_32)
+
+#         return batch
+
+
 def collate_fn(batch: list[dict], pad_token_id: int):
     """
-    Here we collate using padding-free
+    Collate with proper attention masking to prevent cross-sequence attention.
+
+    Creates a block-diagonal causal attention mask so each packed sequence
+    can only attend to itself, matching vLLM's isolated generation context.
     """
     num_tokens_in_batch = 0
     advantages = []
@@ -195,17 +311,41 @@ def collate_fn(batch: list[dict], pad_token_id: int):
     position_ids: list[torch.Tensor] = []
     logprob_ids: list[torch.Tensor] = []
 
+    # Track sequence boundaries for attention mask construction
+    sequence_lengths = []
+
     # in order to average over the sequence length properly
     # we calculate the total batch size here
     grpo_scalars = []
 
+    # okay so we need to do it a little differently.
+    # for flash-attention 2 and padding-free training, we instead provide
+    # - input_ids (as-is)
+    # - position IDs (range up to N) for each sequence always reseting at 0 for the next seq
+    # - seq idx - list of the length of input IDs set to the index of the sequence we are processing
+    # - cu_seq_lens - a list of the cumulative sequence lengths at each index, should be like: [0, N1, N1 + N2, ...]
+    # - cu_seq_lens_k, cu_seq_lens_q : the same list (cu_seq_lens)
+    # - max_length_k, max_length_q : the max length in the index
+
+    max_length = 0
+    cu_seq_lens = [0]
+    seq_idxs = []
+
     for i, item in enumerate(batch):
         last_item = i + 1 == len(batch)
+        seq_len = item["input_ids"].numel()
+
+        max_length = max(max_length, seq_len)
+
         input_ids += [item["input_ids"]]
         logprob_ids += [item["logprob_ids"]]
         logprobs += [item["logprobs"]]
         grpo_mask += [item["grpo_mask"]]
-        position_ids += [torch.arange(0, item["input_ids"].numel(), step=1)]
+        position_ids += [torch.tensor(range(seq_len))]
+        sequence_lengths.append(seq_len)
+        cu_seq_lens.append(cu_seq_lens[-1] + seq_len)
+
+        seq_idxs += [i] * seq_len
 
         # we will use these to divide the final logprobs sequence
         scalars = torch.masked_fill(
@@ -216,24 +356,38 @@ def collate_fn(batch: list[dict], pad_token_id: int):
         advantages += [torch.full_like(item["grpo_mask"], item["advantage"], dtype=torch.float32)]
         grpo_scalars += [scalars]
 
-        if not last_item:
-            input_ids += [torch.tensor([pad_token_id], dtype=torch.long)]
-            logprob_ids += [torch.tensor([pad_token_id], dtype=torch.long)]
-            logprobs += [torch.tensor([1.0])]
-            grpo_mask += [torch.tensor([0.0])]
-            grpo_scalars += [torch.tensor([1])]
-            advantages += [torch.tensor([0.0])]
-            position_ids += [torch.tensor(data=[0.0])]
+    # Create block-diagonal causal attention mask
+    # Each sequence gets a causal mask within its block, zeros elsewhere
+    total_length = sum(sequence_lengths)
+
+    # For HuggingFace models, attention_mask: 1 = attend, 0 = mask out
+    # We'll create a 2D mask that gets broadcast during attention
+    attention_mask = torch.zeros((total_length, total_length), dtype=torch.bool)
+
+    start_idx = 0
+    for seq_len in sequence_lengths:
+        end_idx = start_idx + seq_len
+        # Fill in causal mask for this sequence block
+        for i in range(start_idx, end_idx):
+            # Token i can attend to tokens [start_idx, i] (causal)
+            attention_mask[i, start_idx : i + 1] = True
+        start_idx = end_idx
 
     final_item = {
         "input_ids": torch.cat(input_ids).detach(),
         "position_ids": torch.cat(position_ids).detach(),
+        "attention_mask": attention_mask.detach(),
         "advantages": torch.cat(advantages).detach(),
         "logprobs": torch.cat(logprobs).detach(),
         "logprob_ids": torch.cat(logprob_ids).detach(),
         "grpo_mask": torch.cat(grpo_mask).detach(),
         "scalars": torch.cat(grpo_scalars).detach(),
-        "batch_size": len(batch),
+        "cu_seq_lens": torch.tensor(cu_seq_lens).detach(),
+        "seq_idx": torch.tensor([seq_idxs]).detach(),
+        "max_length_q": int(max_length),
+        "max_length_k": int(max_length),
+        "cu_seq_lens_q": torch.tensor(cu_seq_lens, dtype=torch.int32).detach(),
+        "cu_seq_lens_k": torch.tensor(cu_seq_lens, dtype=torch.int32).detach(),
     }
     return final_item
 
@@ -287,13 +441,28 @@ class OlegDistributedSampler(BatchSampler):
             batch_idxs = shuffled_idxs[i : i + local_batch_size]
             batch_seqs = seqs[:, batch_idxs]  # pull out the indices for this batch at each rank
 
-            # this is redundantly computed on each rank, but the local batch size is actually small so it's not a problem
+            # SIMPLIFIED: Use random packing instead of LPT to avoid same-group clustering
             rank_minibatches = []
-            for rank in range(dist.get_world_size()):
-                # since we keep each rank independent (samples cannot move across ranks), num_ranks=1, rank=0
-                minibatches = batch_lengths_to_minibatches_lpt(
-                    batch_seqs[rank].tolist(), self.max_tokens_per_gpu, num_ranks=1, rank=0
-                )
+            for rank_idx in range(dist.get_world_size()):
+                minibatches = []
+                current_batch = []
+                current_tokens = 0
+
+                # the indices should be identical on all ranks but the lengths vary rank-to-rank
+                for idx, length in zip(batch_idxs.tolist(), batch_seqs[rank_idx].tolist()):
+                    if current_tokens + length > self.max_tokens_per_gpu and current_batch:
+                        # Batch is full, start a new one
+                        minibatches.append(current_batch)
+                        current_batch = [idx]
+                        current_tokens = length
+                    else:
+                        current_batch.append(idx)
+                        current_tokens += length
+
+                # Add remaining batch
+                if current_batch:
+                    minibatches.append(current_batch)
+
                 rank_minibatches.append(minibatches)
 
             # now we apply padding to each rank's minibatches
@@ -391,6 +560,9 @@ def oleg_collate_fn(batch: list[dict], pad_token_id: int, max_tokens_per_gpu: in
     # clear any remaining batches
     assert len(microbatch) == 0
 
+    # number of trainable items in local minibatch
+    items_in_local_minibatch = sum(len(mb) for mb in microbatches)
+
     # now we transform into the final format
     final_microbatches = [{"microbatch": collate_fn(mb, pad_token_id), "padding": False} for mb in microbatches]
 
@@ -400,15 +572,21 @@ def oleg_collate_fn(batch: list[dict], pad_token_id: int, max_tokens_per_gpu: in
             {"microbatch": collate_fn(padding_mb, pad_token_id), "padding": True} for padding_mb in padding_microbatches
         ]
 
-    return final_microbatches
+    return {"microbatches": final_microbatches, "num_samples_in_local_minibatch": items_in_local_minibatch}
 
 
 def create_oleg_grpo_dataloader(
     dataset: list[Sample], pad_token_id: int, max_tokens_per_gpu: int, global_batch_size: int
 ):
-    assert (
-        len(dataset) * dist.get_world_size()
-    ) % global_batch_size == 0  # we need to have an equal amount of samples on every rank
+    # Flatten samples to rollouts first
+    # ds = JsonlDataset(dataset, pad_token_id)
+
+    # Check that total rollouts can be evenly divided by global_batch_size
+    # (Note: len(ds) is rollouts per rank, not total problems)
+    # total_rollouts = len(ds) * dist.get_world_size()
+    # assert total_rollouts % global_batch_size == 0, (
+    #     f"Total rollouts ({total_rollouts}) must be divisible by global_batch_size ({global_batch_size})"
+    # )
 
     local_batch_size = global_batch_size // dist.get_world_size()
     assert global_batch_size % local_batch_size == 0

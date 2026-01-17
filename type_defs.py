@@ -161,7 +161,17 @@ class Sample(pydantic.BaseModel):
             if enable_std_trick:
                 rollout.advantage = 0.0
             else:
-                rollout.advantage = (rollout.score.reward - avg) / (std + eps)
+                adv = (rollout.score.reward - avg) / (std + eps)
+                # CRITICAL: Clamp advantages to prevent extreme policy updates
+                rollout.advantage = max(-10.0, min(10.0, adv))
+
+        nonzero_adv = sum(1 for r in group if abs(r.advantage) > 1e-6)
+        rewards_str = ", ".join(f"{r.score.reward:.1f}" for r in group[:5])  # Show first 5
+        if len(group) > 5:
+            rewards_str += "..."
+        log_rank_0(
+            f"Group: {nonzero_adv}/{len(group)} non-zero adv | rewards=[{rewards_str}] | std={std:.4f} | trigger={enable_std_trick}"
+        )
 
     @classmethod
     def from_chat_completion(cls, problem: Problem, completion: ChatCompletion) -> "Sample":
@@ -242,6 +252,7 @@ class Hyperparameters(pydantic.BaseModel):
     # msl_pre: int =
 
     update_ref_policy_every_n_steps: int = -1  # off by default
+    dr_grpo: bool = False
 
     # change this one to a ratio
     inner_batch_size: int
