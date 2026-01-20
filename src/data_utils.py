@@ -11,7 +11,9 @@ import numpy as np
 import functools
 
 
-def random_problems(seed: int = 42, num_problems: int = 20, min_num: int = 1, max_num: int = 100) -> list[Problem]:
+def random_problems(
+    seed: int = 42, num_problems: int = 20, min_num: int = 1, max_num: int = 100
+) -> list[Problem]:
     random.seed(seed)
     problems: list[Problem] = []
     for _ in range(num_problems):
@@ -51,14 +53,18 @@ def generate_dataset(
     seed: int = 42,
     # ) -> datasets.Dataset:
 ) -> datasets.Dataset:
-    problems = random_problems(seed=seed, num_problems=num_problems, min_num=min_num, max_num=max_num)
+    problems = random_problems(
+        seed=seed, num_problems=num_problems, min_num=min_num, max_num=max_num
+    )
 
     # Convert list of Problem objects to dataset
     problems_dict = [problem.model_dump() for problem in problems]
     dataset = datasets.Dataset.from_list(problems_dict)
     dataset = dataset.map(
         lambda x: {
-            "messages": ([{"role": "system", "content": system_msg}] if system_msg else [])
+            "messages": (
+                [{"role": "system", "content": system_msg}] if system_msg else []
+            )
             + [{"role": "user", "content": x["problem"]}],
         }
     )
@@ -107,6 +113,9 @@ class JsonlDataset(torch.utils.data.Dataset):
             for rollout in sample.rollouts:
                 # skip
                 if not rollout.logprobs:
+                    raise ValueError(
+                        "found a rollout without logprobs, this shouldn't happen"
+                    )
                     continue
 
                 # DIAGNOSTIC: Verify token_ids match logprob tokens
@@ -124,8 +133,12 @@ class JsonlDataset(torch.utils.data.Dataset):
 
                 # this should be good enough
                 input_ids = prompt_input_ids[:] + rollout.token_ids[:]
-                grpo_mask = [False] * len(prompt_input_ids) + [True] * len(rollout.token_ids[:])
-                logprobs_seq = [0.0] * len(prompt_input_ids) + [lp.logprob for lp in rollout.logprobs]
+                grpo_mask = [False] * len(prompt_input_ids) + [True] * len(
+                    rollout.token_ids[:]
+                )
+                logprobs_seq = [0.0] * len(prompt_input_ids) + [
+                    lp.logprob for lp in rollout.logprobs
+                ]
 
                 # now we shift so offset is correct and we predict causal
                 # Suppose our input was "The Cat" and model generated "Sat Down EOS"
@@ -134,11 +147,15 @@ class JsonlDataset(torch.utils.data.Dataset):
                 ]  #      ['The', 'Cat', 'Sat', 'Down', 'EOS']  --> ['The', 'Cat', 'Sat', 'Down']
 
                 # Creates a sequence of           [PAD,   'Sat', 'Down', 'EOS']
-                logprob_tokens: list[int] = [pad_token_id] * len(prompt_input_ids[1:]) + [
-                    lp.token for lp in rollout.logprobs
-                ]
-                grpo_mask = grpo_mask[1:]  # [False, False, True, True, True]       --> [False, True, True, True]
-                logprobs_seq = logprobs_seq[1:]  # [1.0,   1.0,   0.35,  0.93,  0.23]   --> [1.0, 0.35, 0.93, 0.23]
+                logprob_tokens: list[int] = [pad_token_id] * len(
+                    prompt_input_ids[1:]
+                ) + [lp.token for lp in rollout.logprobs]
+                grpo_mask = grpo_mask[
+                    1:
+                ]  # [False, False, True, True, True]       --> [False, True, True, True]
+                logprobs_seq = logprobs_seq[
+                    1:
+                ]  # [1.0,   1.0,   0.35,  0.93,  0.23]   --> [1.0, 0.35, 0.93, 0.23]
                 num_logprobs = len(rollout.logprobs)  # produces 3
 
                 assert len(logprob_tokens) == len(logprobs_seq)
@@ -353,7 +370,9 @@ def collate_fn(batch: list[dict], pad_token_id: int):
             item["grpo_mask"],
             value=item["num_logprobs"],
         )
-        advantages += [torch.full_like(item["grpo_mask"], item["advantage"], dtype=torch.float32)]
+        advantages += [
+            torch.full_like(item["grpo_mask"], item["advantage"], dtype=torch.float32)
+        ]
         grpo_scalars += [scalars]
 
     # Create block-diagonal causal attention mask
@@ -394,7 +413,12 @@ def collate_fn(batch: list[dict], pad_token_id: int):
 
 class OlegDistributedSampler(BatchSampler):
     def __init__(
-        self, dataset: JsonlDataset, max_tokens_per_gpu: int, global_batch_size: int, pad_token_id: int, seed: int = 67
+        self,
+        dataset: JsonlDataset,
+        max_tokens_per_gpu: int,
+        global_batch_size: int,
+        pad_token_id: int,
+        seed: int = 67,
     ):
         self.dataset = dataset
         self.max_tokens_per_gpu = max_tokens_per_gpu
@@ -402,6 +426,7 @@ class OlegDistributedSampler(BatchSampler):
         self.pad_token_id = pad_token_id
         self.seed = seed
         self._epoch = 0
+        self._rank = dist.get_rank()  # global rank for data parallel is correct
 
         # ensure the batch is even across all procs
         ds_lens = torch.zeros((dist.get_world_size(),), device=torch.device("cuda"))
@@ -412,9 +437,15 @@ class OlegDistributedSampler(BatchSampler):
 
         # now we perform the initialization step
         rank = dist.get_rank()
-        seq_lens = torch.zeros((dist.get_world_size(), len(dataset)), dtype=torch.long, device=torch.device("cuda"))
+        seq_lens = torch.zeros(
+            (dist.get_world_size(), len(dataset)),
+            dtype=torch.long,
+            device=torch.device("cuda"),
+        )
         seq_lens[rank] = torch.tensor(
-            [item["seq_len"] for item in dataset], dtype=torch.long, device=torch.device("cuda")
+            [item["seq_len"] for item in dataset],
+            dtype=torch.long,
+            device=torch.device("cuda"),
         )
         dist.all_reduce(seq_lens, op=dist.ReduceOp.SUM)
 
@@ -439,7 +470,9 @@ class OlegDistributedSampler(BatchSampler):
         shuffled_idxs = np.random.RandomState(self.seed + self.epoch).permutation(idxs)
         for i in range(0, len(shuffled_idxs), local_batch_size):
             batch_idxs = shuffled_idxs[i : i + local_batch_size]
-            batch_seqs = seqs[:, batch_idxs]  # pull out the indices for this batch at each rank
+            batch_seqs = seqs[
+                :, batch_idxs
+            ]  # pull out the indices for this batch at each rank
 
             # SIMPLIFIED: Use random packing instead of LPT to avoid same-group clustering
             rank_minibatches = []
@@ -449,8 +482,13 @@ class OlegDistributedSampler(BatchSampler):
                 current_tokens = 0
 
                 # the indices should be identical on all ranks but the lengths vary rank-to-rank
-                for idx, length in zip(batch_idxs.tolist(), batch_seqs[rank_idx].tolist()):
-                    if current_tokens + length > self.max_tokens_per_gpu and current_batch:
+                for idx, length in zip(
+                    batch_idxs.tolist(), batch_seqs[rank_idx].tolist()
+                ):
+                    if (
+                        current_tokens + length > self.max_tokens_per_gpu
+                        and current_batch
+                    ):
                         # Batch is full, start a new one
                         minibatches.append(current_batch)
                         current_batch = [idx]
@@ -469,7 +507,9 @@ class OlegDistributedSampler(BatchSampler):
             max_mb_len = max(len(mb) for mb in rank_minibatches)
             for mb in rank_minibatches:
                 if len(mb) < max_mb_len:
-                    mb.extend([[-1]] * (max_mb_len - len(mb)))  # witchcraft to add empty minibatches
+                    mb.extend(
+                        [[-1]] * (max_mb_len - len(mb))
+                    )  # witchcraft to add empty minibatches
 
             # sanity check
             assert all(len(mb) == max_mb_len for mb in rank_minibatches)
@@ -480,8 +520,14 @@ class OlegDistributedSampler(BatchSampler):
             #         print(f"rank {curr_r} rank_minibatches: {rank_minibatches[curr_r]}")
 
             num_microbatches = len(rank_minibatches[dist.get_rank()])
-            flattened_indices = [idx for sublist in rank_minibatches[dist.get_rank()] for idx in (sublist + [-67])]
-            num_samples = sum(len(sublist) for sublist in rank_minibatches[dist.get_rank()])
+            flattened_indices = [
+                idx
+                for sublist in rank_minibatches[dist.get_rank()]
+                for idx in (sublist + [-67])
+            ]
+            num_samples = sum(
+                len(sublist) for sublist in rank_minibatches[dist.get_rank()]
+            )
 
             # try:
             assert len(flattened_indices) > 0
@@ -514,7 +560,17 @@ class OlegDistributedSampler(BatchSampler):
             yield flattened_indices
 
     def __len__(self):
-        return len(self.all_seqs)
+        # keep this
+        all_lens = [len(self.all_seqs[r]) for r in range(dist.get_world_size())]
+        assert [all_lens[0] == l for l in all_lens], (
+            f"expected even amount of sequence lengths across all ranks but found disparity: {all_lens=}"
+        )
+
+        # this should be the accurate calculation though
+        local_batch_size = self.global_batch_size // dist.get_world_size()
+
+        # len(dataset) is the length of the local sharded dataset
+        return len(self.dataset) // local_batch_size
 
     def set_epoch(self, epoch: int):
         self._epoch = epoch
@@ -534,28 +590,31 @@ def oleg_collate_fn(batch: list[dict], pad_token_id: int, max_tokens_per_gpu: in
     assert not batch[0]["is_delimiter"]
 
     padding_microbatches = []
+    padding_microbatch = []
 
     # collates batches into how we packed them
     for i, item in enumerate(batch):
         is_last = i + 1 == len(batch)
         item: JsonlDatasetEntry
-        if item["is_delimiter"]:
-            if microbatch:
-                microbatches.append(microbatch)
-            microbatch = []
-            continue
 
         # by now the delimiter should have appended the non-padding batch or this is the first one
         if item["is_padding"]:
-            padding_microbatches.append([item])
-            microbatch = []
-            continue
+            padding_microbatch.append(item)
+        elif not item["is_delimiter"]:
+            # add to the microbatch
+            microbatch.append(item)
 
-        # add to the microbatch
-        microbatch.append(item)
-        if is_last and len(microbatch):
-            microbatches.append(microbatch)
-            microbatch = []
+        if is_last or item["is_delimiter"]:
+            if microbatch:
+                microbatches.append(microbatch)
+                microbatch = []
+            elif padding_microbatch:
+                padding_microbatches.append(padding_microbatch)
+                padding_microbatch = []
+            else:
+                raise ValueError(
+                    "received an empty delimeter without the microbatch or padding being populated"
+                )
 
     # clear any remaining batches
     assert len(microbatch) == 0
@@ -564,19 +623,29 @@ def oleg_collate_fn(batch: list[dict], pad_token_id: int, max_tokens_per_gpu: in
     items_in_local_minibatch = sum(len(mb) for mb in microbatches)
 
     # now we transform into the final format
-    final_microbatches = [{"microbatch": collate_fn(mb, pad_token_id), "padding": False} for mb in microbatches]
+    final_microbatches = [
+        {"microbatch": collate_fn(mb, pad_token_id), "padding": False}
+        for mb in microbatches
+    ]
 
     # add the remaining padding items
     if padding_microbatches:
         final_microbatches += [
-            {"microbatch": collate_fn(padding_mb, pad_token_id), "padding": True} for padding_mb in padding_microbatches
+            {"microbatch": collate_fn(padding_mb, pad_token_id), "padding": True}
+            for padding_mb in padding_microbatches
         ]
 
-    return {"microbatches": final_microbatches, "num_samples_in_local_minibatch": items_in_local_minibatch}
+    return {
+        "microbatches": final_microbatches,
+        "num_samples_in_local_minibatch": items_in_local_minibatch,
+    }
 
 
 def create_oleg_grpo_dataloader(
-    dataset: list[Sample], pad_token_id: int, max_tokens_per_gpu: int, global_batch_size: int
+    dataset: list[Sample],
+    pad_token_id: int,
+    max_tokens_per_gpu: int,
+    global_batch_size: int,
 ):
     # Flatten samples to rollouts first
     # ds = JsonlDataset(dataset, pad_token_id)
@@ -592,9 +661,13 @@ def create_oleg_grpo_dataloader(
     assert global_batch_size % local_batch_size == 0
 
     ds = JsonlDataset(dataset, pad_token_id)
-    sampler = OlegDistributedSampler(ds, max_tokens_per_gpu, global_batch_size, pad_token_id)
+    sampler = OlegDistributedSampler(
+        ds, max_tokens_per_gpu, global_batch_size, pad_token_id
+    )
     _oleg_collate_fn = functools.partial(
-        oleg_collate_fn, pad_token_id=pad_token_id, max_tokens_per_gpu=max_tokens_per_gpu
+        oleg_collate_fn,
+        pad_token_id=pad_token_id,
+        max_tokens_per_gpu=max_tokens_per_gpu,
     )
     loader = DataLoader(
         ds,
@@ -658,11 +731,16 @@ class ProblemDataset(torch.utils.data.Dataset):
         eval_dataset = None
 
         if eval_split > 0:
-            dataset_dict = train_dataset.train_test_split(test_size=eval_split, seed=seed)
+            dataset_dict = train_dataset.train_test_split(
+                test_size=eval_split, seed=seed
+            )
             train_dataset = dataset_dict["train"]
             eval_dataset = dataset_dict["test"]
 
-        return (ProblemDataset(train_dataset), ProblemDataset(eval_dataset) if eval_dataset else None)
+        return (
+            ProblemDataset(train_dataset),
+            ProblemDataset(eval_dataset) if eval_dataset else None,
+        )
 
     @classmethod
     def from_gsm8k(cls, eval_split: float = 0.0, seed: int = 67):
@@ -690,11 +768,16 @@ class ProblemDataset(torch.utils.data.Dataset):
         eval_dataset = None
 
         if eval_split > 0:
-            dataset_dict = train_dataset.train_test_split(test_size=eval_split, seed=seed)
+            dataset_dict = train_dataset.train_test_split(
+                test_size=eval_split, seed=seed
+            )
             train_dataset = dataset_dict["train"]
             eval_dataset = dataset_dict["test"]
 
-        return (ProblemDataset(train_dataset), ProblemDataset(eval_dataset) if eval_dataset else None)
+        return (
+            ProblemDataset(train_dataset),
+            ProblemDataset(eval_dataset) if eval_dataset else None,
+        )
 
 
 def problem_collate_fn(batch: list[Problem]) -> list[Problem]:
