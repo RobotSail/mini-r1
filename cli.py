@@ -566,8 +566,10 @@ class GRPOTrainer:
 
         # Print rollout summary table
         log.info(f"--- Rollout Summary ({len(rollouts)} rollouts) ---")
-        log.info("Rank | Reward | Correct | Parsed Answer")
-        log.info("-----|--------|---------|----------------------")
+        log.info("Rank | Reward | Correct | Parsed Answer        | Last 40 chars")
+        log.info(
+            "-----|--------|---------|----------------------|------------------------------------------"
+        )
 
         max_rows = 10
         for idx, rollout in enumerate(sorted_rollouts[:max_rows]):
@@ -576,7 +578,14 @@ class GRPOTrainer:
             reward = f"{rollout.score.reward:.2f}"
             correct = "Yes" if rollout.score.is_correct else "No"
             parsed = self._extract_raw_answer(rollout.response)
-            log.info(f"{rank:>3}{marker} | {reward:>6} | {correct:>7} | {parsed}")
+            last_40 = (
+                rollout.response[-40:].replace("\n", "↵")
+                if len(rollout.response) >= 40
+                else rollout.response.replace("\n", "↵")
+            )
+            log.info(
+                f"{rank:>3}{marker} | {reward:>6} | {correct:>7} | {parsed:<20} | {last_40}"
+            )
 
         if len(sorted_rollouts) > max_rows:
             log.info(f"... ({len(sorted_rollouts) - max_rows} more rollouts)")
@@ -709,11 +718,6 @@ class GRPOTrainer:
         dist.all_reduce(rewards_tensor, op=dist.ReduceOp.SUM)
         # total_rewards = rewards_tensor.item()
 
-        # if total_rewards > 0:
-        #     log_rank_0("=" * 80)
-        #     log_rank_0("🎉 TRAINING ON ROLLOUTS WITH POSITIVE REWARDS 🎉")
-        #     log_rank_0("=" * 80)
-
         # Create the distributed data loader with lockstep microbatches
         # This generator yields AccumulationWindow objects
         # NOTE: global_batch_size should be total rollouts (batch_size * group_size) to ensure
@@ -728,11 +732,7 @@ class GRPOTrainer:
         )
 
         # now we train
-        # log_rank_0(
-        #     f"[DEBUG] Starting training on rollouts, inner_epochs={self.ctx.hparams.inner_epochs}, dataloader created"
-        # )
         for epoch in range(self.ctx.hparams.inner_epochs):
-            # log_rank_0(f"[DEBUG] Starting inner epoch {epoch}")
             # Iterate through accumulation windows (each window = K microbatches)
             batch_count = 0
             for minibatch in data_loader:
@@ -824,10 +824,7 @@ class GRPOTrainer:
                         "max_length_k": max_length_k,
                     }
 
-                    # we're not calculating cross-entropy against static labels, so no label inputs
-                    # are needed here
-                    # print("just before calling model.forward")
-                    # dist.breakpoint()
+                    # forward
                     new_outputs = self.ctx.model(
                         input_ids=input_ids,
                         position_ids=position_ids,
@@ -846,20 +843,13 @@ class GRPOTrainer:
                     # prepare for GRPO loss calculation, pluck out the logits that we're going to work with
                     gather_indices = logprob_ids.clone().unsqueeze(-1)  # (1, B*T, 1)
                     assert gather_indices.shape == (1, T, 1)
-
                     # (1, B, V)
                     new_logits = new_outputs.logits.float()
                     assert new_logits.shape == (1, T, V)
-                    # log_rank_0(
-                    #     f"[GRPO] Step 2: Extract new logits | new_outputs.logits: {new_outputs.logits.shape} -> new_logits: {new_logits.shape}"
-                    # )
 
                     # account for sampling temperature
                     if self.ctx.sampling_params.temperature > 0:
                         new_logits /= self.ctx.sampling_params.temperature
-                        # log_rank_0(
-                        #     f"[GRPO] Step 2a: Apply temperature | temperature: {self.ctx.sampling_params.temperature} | new_logits: {new_logits.shape} (in-place)"
-                        # )
 
                     # now let's get the reference logits, but we really want to make sure that we don't
                     # backprop on this model
@@ -908,11 +898,6 @@ class GRPOTrainer:
 
                     # hopefully clears the reference model cache
                     torch.cuda.empty_cache()
-
-                    # we need the new logprobs
-                    # new logprobs will be of size (1, B, V), so IDS need to be of shape (1, B, 1)
-                    # logprob IDS are (1, B), so we unsqueeze into V
-
                     # 3. Calculate the latest logprobs
                     # more efficient technique
                     # (1, B, V) --> (1, B, 1)
@@ -938,210 +923,13 @@ class GRPOTrainer:
                     assert new_logsumexp.shape == (1, T, 1)
                     new_logsumexp = new_logsumexp.squeeze(-1)  # (1, B, 1) -> (1, B)
                     assert new_logsumexp.shape == (1, T)
-                    # log_rank_0(
-                    #     f"[GRPO] Step 5: Compute new logsumexp | new_logits: {new_logits.shape} -> new_logsumexp: {new_logsumexp.shape}"
-                    # )
-
-                    # so a logprob is defined as log(p(x))
-                    # and p(x) is defined as e^x / sum(e^z for z in X) where X is the sample space
-                    # so the logprob would be equal to log(e^x / (sum(e^z for z in X))) which is the same as: x - log(sum(e^z for z in X))
 
                     # so this definition should be correct
                     new_logprobs = new_gathered_logits - new_logsumexp  # (1, B)
                     assert new_logprobs.shape == (1, T)
-                    # log_rank_0(
-                    #     f"[GRPO] Step 6: Compute new logprobs | new_gathered_logits: {new_gathered_logits.shape}, new_logsumexp: {new_logsumexp.shape} -> new_logprobs: {new_logprobs.shape}"
-                    # )
                     assert len(new_logprobs.shape) == 2
 
-                    # # DIAGNOSTIC: Print sequence data for debugging collation
-                    if (
-                        not microbatch["padding"]
-                        and self._training_step % 10 == 0
-                        and microbatch_idx == 0
-                    ):
-                        seq_len = min(1024, input_ids.shape[1])
-
-                        #     # Compute logprob difference statistics for masked tokens only
-                        masked_indices = grpo_logit_mask[0].bool()
-                        if masked_indices.sum() > 0:
-                            old_lp_masked = old_logprobs[0][masked_indices]
-                            new_lp_masked = new_logprobs[0][masked_indices]
-                            lp_diff_masked = new_lp_masked - old_lp_masked
-
-                            log_rank_0("\n" + "=" * 200)
-                            log_rank_0(
-                                f"LOGPROB MISMATCH DIAGNOSTIC (Step {self._training_step})"
-                            )
-                            log_rank_0("=" * 200)
-                            log_rank_0(
-                                f"Temperature: {self.ctx.sampling_params.temperature}"
-                            )
-                            log_rank_0(
-                                f"Masked tokens: {masked_indices.sum().item()}/{len(masked_indices)}"
-                            )
-                            log_rank_0(
-                                f"Old LP (vLLM):  mean={old_lp_masked.mean():.6f}, std={old_lp_masked.std():.6f}, min={old_lp_masked.min():.6f}, max={old_lp_masked.max():.6f}"
-                            )
-                            log_rank_0(
-                                f"New LP (train): mean={new_lp_masked.mean():.6f}, std={new_lp_masked.std():.6f}, min={new_lp_masked.min():.6f}, max={new_lp_masked.max():.6f}"
-                            )
-                            log_rank_0(
-                                f"LP Difference:  mean={lp_diff_masked.mean():.6f}, std={lp_diff_masked.std():.6f}, min={lp_diff_masked.min():.6f}, max={lp_diff_masked.max():.6f}"
-                            )
-                            log_rank_0(
-                                f"Abs LP Diff:    mean={lp_diff_masked.abs().mean():.6f}, max={lp_diff_masked.abs().max():.6f}"
-                            )
-
-                        #         # OUTLIER ANALYSIS: Find top 20 worst mismatches
-                        #         log_rank_0("\n--- TOP 20 OUTLIER TOKENS ---")
-                        #         lp_diff_full = (new_logprobs - old_logprobs)[0]
-                        #         abs_diff_full = lp_diff_full.abs().clone()
-                        #         abs_diff_full[~grpo_logit_mask[0].bool()] = -1  # Ignore non-masked
-
-                        #         top_k = min(20, masked_indices.sum().item())
-                        #         top_vals, top_idxs = abs_diff_full.topk(top_k)
-
-                        #         log_rank_0(
-                        #             f"{'Rank':<5} | {'Pos':<6} | {'PosID':<6} | {'TokID':<8} | {'Token':<20} | {'Old_LP':<12} | {'New_LP':<12} | {'Diff':<12}"
-                        #         )
-                        #         log_rank_0("-" * 100)
-
-                        #         for rank, (idx, diff_val) in enumerate(zip(top_idxs.tolist(), top_vals.tolist())):
-                        #             pos_id = position_ids[0, idx].item()
-                        #             tok_id = logprob_ids[0, idx].item()
-                        #             tok_str = self.ctx.tokenizer.decode([tok_id])[:18]
-                        #             old_lp = old_logprobs[0, idx].item()
-                        #             new_lp = new_logprobs[0, idx].item()
-                        #             log_rank_0(
-                        #                 f"{rank + 1:<5} | {idx:<6} | {pos_id:<6} | {tok_id:<8} | {repr(tok_str):<20} | {old_lp:<12.6f} | {new_lp:<12.6f} | {diff_val:<12.6f}"
-                        #             )
-
-                        #         # POSITION ANALYSIS: Check if outliers cluster at sequence starts
-                        #         outlier_threshold = 0.5
-                        #         outlier_mask = abs_diff_full > outlier_threshold
-                        #         if outlier_mask.sum() > 0:
-                        #             outlier_pos_ids = position_ids[0][outlier_mask]
-                        #             log_rank_0(f"\n--- OUTLIER POSITION ANALYSIS (|diff| > {outlier_threshold}) ---")
-                        #             log_rank_0(f"Total outliers: {outlier_mask.sum().item()}")
-                        #             log_rank_0(f"Outliers at pos_id=0: {(outlier_pos_ids == 0).sum().item()}")
-                        #             log_rank_0(f"Outliers at pos_id<5: {(outlier_pos_ids < 5).sum().item()}")
-                        #             log_rank_0(
-                        #                 f"Position ID distribution: min={outlier_pos_ids.min().item()}, max={outlier_pos_ids.max().item()}, mean={outlier_pos_ids.float().mean().item():.1f}"
-                        #             )
-
-                        #         # CORRELATION ANALYSIS: Does diff correlate with position?
-                        #         masked_pos_ids = position_ids[0][masked_indices].float()
-                        #         masked_diffs = lp_diff_masked
-
-                        #         # Compute Pearson correlation
-                        #         pos_mean = masked_pos_ids.mean()
-                        #         diff_mean = masked_diffs.mean()
-                        #         pos_centered = masked_pos_ids - pos_mean
-                        #         diff_centered = masked_diffs - diff_mean
-                        #         correlation = (pos_centered * diff_centered).sum() / (
-                        #             (pos_centered.pow(2).sum().sqrt()) * (diff_centered.pow(2).sum().sqrt()) + 1e-8
-                        #         )
-
-                        #         # Bucket analysis: average diff by position ranges
-                        #         log_rank_0(f"\n--- POSITION-DIFF CORRELATION ---")
-                        #         log_rank_0(f"Pearson correlation (pos_id vs diff): {correlation.item():.4f}")
-
-                        #         log_rank_0("\n--- DIFF BY POSITION BUCKET ---")
-                        #         buckets = [(0, 50), (50, 100), (100, 200), (200, 300), (300, 400), (400, 500)]
-                        #         for lo, hi in buckets:
-                        #             bucket_mask = (masked_pos_ids >= lo) & (masked_pos_ids < hi)
-                        #             if bucket_mask.sum() > 0:
-                        #                 bucket_diffs = masked_diffs[bucket_mask]
-                        #                 log_rank_0(
-                        #                     f"  pos_id [{lo:3d}-{hi:3d}): n={bucket_mask.sum().item():4d}, mean_diff={bucket_diffs.mean().item():+.4f}, abs_mean={bucket_diffs.abs().mean().item():.4f}"
-                        #                 )
-
-                        #         # TOKEN ANALYSIS: Check if specific tokens consistently have large diffs
-                        #         log_rank_0("\n--- TOKEN-SPECIFIC DIFF ANALYSIS ---")
-                        #         masked_tok_ids = logprob_ids[0][masked_indices]
-
-                        #         # Group by token ID and compute stats
-                        #         unique_toks = masked_tok_ids.unique()
-                        #         tok_stats = []
-                        #         for tok_id in unique_toks:
-                        #             tok_mask = masked_tok_ids == tok_id
-                        #             if tok_mask.sum() >= 3:  # Only tokens appearing 3+ times
-                        #                 tok_diffs = masked_diffs[tok_mask]
-                        #                 tok_stats.append(
-                        #                     {
-                        #                         "tok_id": tok_id.item(),
-                        #                         "count": tok_mask.sum().item(),
-                        #                         "mean_diff": tok_diffs.mean().item(),
-                        #                         "abs_mean": tok_diffs.abs().mean().item(),
-                        #                     }
-                        #                 )
-
-                        #         # Sort by abs_mean diff and show top 15
-                        #         tok_stats.sort(key=lambda x: x["abs_mean"], reverse=True)
-                        #         log_rank_0(
-                        #             f"{'TokID':<8} | {'Token':<20} | {'Count':<6} | {'Mean_Diff':<12} | {'Abs_Mean':<12}"
-                        #         )
-                        #         log_rank_0("-" * 70)
-                        #         for stat in tok_stats[:15]:
-                        #             tok_str = self.ctx.tokenizer.decode([stat["tok_id"]])[:18]
-                        #             log_rank_0(
-                        #                 f"{stat['tok_id']:<8} | {repr(tok_str):<20} | {stat['count']:<6} | {stat['mean_diff']:+.6f} | {stat['abs_mean']:.6f}"
-                        #             )
-
-                        #         log_rank_0("=" * 200 + "\n")
-
-                        # # Toggle to show/hide decoded token columns
-                        # show_decoded_tokens = True
-
-                        # log_rank_0("\n" + "=" * 200)
-                        # log_rank_0(
-                        #     f"SEQUENCE DIAGNOSTIC (Step {self._training_step}, first {seq_len} tokens)"
-                        # )
-                        # log_rank_0("=" * 200)
-
-                        # if show_decoded_tokens:
-                        #     log_rank_0(
-                        #         f"{'Pos':<6} | {'Input_ID':<10} | {'Input_Tok':<25} | {'Target_ID':<10} | {'Target_Tok':<25} | {'Mask':<6} | {'Adv':<10} | {'Scalar':<10} | {'Old_LP':<12} | {'New_LP':<12} | {'LP_Diff':<12}"
-                        #     )
-                        # else:
-                        #     log_rank_0(
-                        #         f"{'Pos':<6} | {'Input_ID':<10} | {'Target_ID':<10} | {'Mask':<6} | {'Adv':<10} | {'Scalar':<10} | {'Old_LP':<12} | {'New_LP':<12} | {'LP_Diff':<12}"
-                        #     )
-                        # log_rank_0("-" * 200)
-
-                        # for t in range(seq_len):
-                        #     inp_id = input_ids[0, t].item()
-                        #     tgt_id = logprob_ids[0, t].item()
-                        #     old_lp = old_logprobs[0, t].item()
-                        #     new_lp = new_logprobs[0, t].item()
-                        #     lp_diff = new_lp - old_lp
-                        #     mask = grpo_logit_mask[0, t].item()
-                        #     adv = advantages[0, t].item()
-                        #     scalar = scalars[0, t].item()
-
-                        #     if show_decoded_tokens:
-                        #         # Decode tokens
-                        #         inp_tok = self.ctx.tokenizer.decode([inp_id])
-                        #         tgt_tok = self.ctx.tokenizer.decode([tgt_id])
-
-                        #         # Truncate long tokens and escape special chars
-                        #         inp_tok = repr(inp_tok)[:23]
-                        #         tgt_tok = repr(tgt_tok)[:23]
-
-                        #         log_rank_0(
-                        #             f"{t:<6} | {inp_id:<10} | {inp_tok:<25} | {tgt_id:<10} | {tgt_tok:<25} | {str(mask):<6} | {adv:<10.4f} | {scalar:<10} | {old_lp:<12.6f} | {new_lp:<12.6f} | {lp_diff:<12.6f}"
-                        #         )
-                        #     else:
-                        #         log_rank_0(
-                        #             f"{t:<6} | {inp_id:<10} | {tgt_id:<10} | {str(mask):<6} | {adv:<10.4f} | {scalar:<10} | {old_lp:<12.6f} | {new_lp:<12.6f} | {lp_diff:<12.6f}"
-                        #         )
-
-                        # log_rank_0("=" * 200 + "\n")
-
                     # 4. Compute the importance ratio
-                    # here's where we need to actually compute the loss. first thing we need is to calculate
-                    # the importance ratio:
                     # \rho(\theta_0)=\exp(\log p_{\theta_0}-\log p_{\text{old}})
                     assert old_logprobs.shape == new_logprobs.shape
 
@@ -1160,9 +948,6 @@ class GRPOTrainer:
                     )
                     assert advantages.shape == (1, T), f"{advantages.shape} != {(1, T)}"
                     assert unclipped.shape == (1, T), f"{unclipped.shape} != {(1, T)}"
-                    # log_rank_0(
-                    #     f"[GRPO] Step 11: Compute unclipped surrogate | advantages: {advantages.shape}, importance_ratio: {importance_ratio.shape} -> unclipped: {unclipped.shape}"
-                    # )
 
                     # (1,B) * (1,B)
                     clipped_ratio = importance_ratio.clamp(
@@ -1171,40 +956,16 @@ class GRPOTrainer:
                     assert clipped_ratio.shape == (1, T)
                     clipped = advantages * clipped_ratio
                     assert clipped_ratio.shape == (1, T)
-                    # log_rank_0(
-                    #     f"[GRPO] Step 12: Compute clipped surrogate | advantages: {advantages.shape}, importance_ratio.clamp: {importance_ratio.shape}, eps: {self.ctx.hparams.eps} -> clipped: {clipped.shape}"
-                    # )
-
-                    # Diagnostic: track importance ratio clipping
-                    if not microbatch["padding"]:
-                        ratio_clipped_frac = (
-                            (importance_ratio != clipped_ratio)
-                            * grpo_logit_mask.float()
-                        ).sum() / grpo_logit_mask.sum()
-                        ratio_mean = (
-                            importance_ratio * grpo_logit_mask.float()
-                        ).sum() / grpo_logit_mask.sum()
 
                     clipped_surrogate = torch.minimum(unclipped, clipped)
                     assert clipped_surrogate.shape == (1, T)
-                    # log_rank_0(
-                    #     f"[GRPO] Step 13: Take minimum | unclipped: {unclipped.shape}, clipped: {clipped.shape} -> clipped_surrogate: {clipped_surrogate.shape}"
-                    # )
 
-                    # 6. Next, we need to calculate the approximate KL penalty to the ref policy
-                    # KL(policy_new || policy_ref) ~= policy_ref/policy_new - log(policyref/policy_new) - 1
                     logprob_diff = (ref_logprobs - new_logprobs).clamp(-20, 20)
                     assert logprob_diff.shape == (1, T)
-                    # log_rank_0(
-                    #     f"[GRPO] Step 14: Compute logprob diff | ref_logprobs: {ref_logprobs.shape}, new_logprobs: {new_logprobs.shape} -> logprob_diff: {logprob_diff.shape}"
-                    # )
 
                     dkl_approx = logprob_diff.exp() - logprob_diff - 1
                     dkl_approx = dkl_approx.clamp(0, 100)
                     assert dkl_approx.shape == (1, T)
-                    # log_rank_0(
-                    #     f"[GRPO] Step 15: Compute approx KL | logprob_diff: {logprob_diff.shape} -> dkl_approx: {dkl_approx.shape}"
-                    # )
 
                     # Accumulate KL for logging (only for non-padding batches)
                     if not microbatch["padding"]:
@@ -1212,18 +973,10 @@ class GRPOTrainer:
 
                     masked_kl = dkl_approx * grpo_logit_mask.float()
                     assert masked_kl.shape == (1, T)
-
-                    # each token-wise KL term is scaled by the sequence length and then averaged across the entire batch
                     assert scalars.shape == (1, T)
                     avg_kl = (masked_kl / scalars).sum() / batch_size
 
-                    # log_rank_0(
-                    #     f"[GRPO] Step 16: Mask KL for logging | dkl_approx: {dkl_approx.shape}, grpo_logit_mask: {grpo_logit_mask.shape} -> masked_kl: {masked_kl:.6f}, num_tokens: {num_tokens}"
-                    # )
                     accum_kl_sum += avg_kl
-
-                    # 7. Compute per-token loss L_GRPO = L_clip - L_kl
-                    # compute the per-sample loss (loss for all samples is independent at this point)
                     assert dkl_approx.shape == clipped_surrogate.shape, (
                         f"{dkl_approx.shape=} != {clipped_surrogate.shape=}"
                     )
@@ -1232,33 +985,14 @@ class GRPOTrainer:
                         - self.ctx.hparams.kl_penalty_strength * dkl_approx
                     )
                     assert per_token_loss.shape == (1, T)
-                    # log_rank_0(
-                    #     f"[GRPO] Step 17: Compute per-token loss | clipped_surrogate: {clipped_surrogate.shape}, dkl_approx: {dkl_approx.shape}, kl_strength: {self.ctx.hparams.kl_penalty_strength} -> per_token_loss: {per_token_loss.shape}"
-                    # )
-
                     # 8. Mask out all invalid logprobs that aren't from the GRPO rollouts
                     assert grpo_logit_mask.shape == (1, T)
                     grpo_token_loss = per_token_loss * grpo_logit_mask.float()
                     assert grpo_token_loss.shape == (1, T)
-
-                    # log_rank_0(
-                    #     f"[GRPO] Step 18: Apply GRPO mask | per_token_loss: {per_token_loss.shape}, grpo_logit_mask: {grpo_logit_mask.shape} -> grpo_token_loss: {grpo_token_loss.shape}"
-                    # )
-
-                    # --- loss aggregation ---
-                    # 9. Next, we average each batch by the **sequence length**, then we average by the group-size
-                    # Warning: sequence-length averaging assigns greater weight to shorter sequences than longer ones
-                    # but in our case this is fine, since we only care about an objective reward
-                    # (B,) --> (B, 1)
-
-                    # now we divide each token loss by the number of logprobs
                     # this achieves length averaging.
                     if not self.ctx.hparams.dr_grpo:
                         assert grpo_token_loss.shape == scalars.shape
                         grpo_token_loss = grpo_token_loss / scalars.float()
-                    # log_rank_0(
-                    #     f"[GRPO] Step 19: Length averaging | grpo_token_loss: {grpo_token_loss.shape}, scalars: {scalars.shape} -> grpo_token_loss: {grpo_token_loss.shape} (in-place)"
-                    # )
 
                     # this should achieve the group average
                     # we need to multiply our loss by the world size because FSDP2 will try to average the loss by the world size
@@ -1268,96 +1002,20 @@ class GRPOTrainer:
                         grpo_token_loss.sum(dim=-1) * dist.get_world_size()
                     ) / batch_size
                     assert grpo_sequence_loss.shape == (1,)
-                    # log_rank_0(
-                    #     f"[GRPO] Step 20: Group averaging | grpo_token_loss: {grpo_token_loss.shape}, batch_size: {batch_size} -> grpo_sequence_loss: {grpo_sequence_loss.shape}"
-                    # )
 
                     grpo_loss = -grpo_sequence_loss
                     assert grpo_loss.shape == (1,)
-                    # log_rank_0(
-                    #     f"[GRPO] Step 21: Negate for loss | grpo_sequence_loss: {grpo_sequence_loss.shape} -> grpo_loss: {grpo_loss.shape}"
-                    # )
-
                     # For padding batches, zero out the loss so it doesn't contribute to gradients
                     # We still run forward/backward to keep FSDP collectives in sync
                     if microbatch["padding"]:
                         grpo_loss = grpo_loss * 0.0
                         # log_rank_0(f"[GRPO] Step 22: Zero padding loss | grpo_loss: {grpo_loss.shape} (in-place)")
-
-                    # # DIAGNOSTIC: Per-token GRPO analysis before backward
-                    # if (
-                    #     not microbatch["padding"]
-                    #     and self._training_step % 10 == 0
-                    #     and microbatch_idx == 0
-                    # ):
-                    #     masked_indices = grpo_logit_mask[0].bool()
-                    #     if masked_indices.sum() > 0:
-                    #         # Extract masked values for analysis
-                    #         masked_advantages = advantages[0][masked_indices]
-                    #         masked_scalars = scalars[0][masked_indices]
-                    #         masked_token_loss = grpo_token_loss[0][masked_indices]
-                    #         masked_importance_ratio = importance_ratio[0][
-                    #             masked_indices
-                    #         ]
-                    #         masked_kl = dkl_approx[0][masked_indices]
-
-                    #         log_rank_0("\n" + "=" * 120)
-                    #         log_rank_0(
-                    #             f"GRPO TOKEN ANALYSIS (Step {self._training_step}, MB {microbatch_idx})"
-                    #         )
-                    #         log_rank_0("=" * 120)
-                    #         log_rank_0(
-                    #             f"Masked tokens: {masked_indices.sum().item()}/{len(masked_indices)} | Batch size: {batch_size}"
-                    #         )
-                    #         log_rank_0(f"Total loss: {grpo_loss.item():.6f}")
-                    #         log_rank_0("")
-                    #         log_rank_0(
-                    #             f"{'Metric':<20} | {'Mean':>12} | {'Std':>12} | {'Min':>12} | {'Max':>12}"
-                    #         )
-                    #         log_rank_0("-" * 80)
-                    #         log_rank_0(
-                    #             f"{'Advantage':<20} | {masked_advantages.mean():>12.4f} | {masked_advantages.std():>12.4f} | {masked_advantages.min():>12.4f} | {masked_advantages.max():>12.4f}"
-                    #         )
-                    #         log_rank_0(
-                    #             f"{'Scalar (len-avg)':<20} | {masked_scalars.float().mean():>12.1f} | {masked_scalars.float().std():>12.1f} | {masked_scalars.min():>12.0f} | {masked_scalars.max():>12.0f}"
-                    #         )
-                    #         log_rank_0(
-                    #             f"{'Token Loss':<20} | {masked_token_loss.mean():>12.6f} | {masked_token_loss.std():>12.6f} | {masked_token_loss.min():>12.6f} | {masked_token_loss.max():>12.6f}"
-                    #         )
-                    #         log_rank_0(
-                    #             f"{'Importance Ratio':<20} | {masked_importance_ratio.mean():>12.4f} | {masked_importance_ratio.std():>12.4f} | {masked_importance_ratio.min():>12.4f} | {masked_importance_ratio.max():>12.4f}"
-                    #         )
-                    #         log_rank_0(
-                    #             f"{'KL (approx)':<20} | {masked_kl.mean():>12.6f} | {masked_kl.std():>12.6f} | {masked_kl.min():>12.6f} | {masked_kl.max():>12.6f}"
-                    #         )
-
-                    #         # Print entire sequence sequentially
-                    #         global_indices = masked_indices.nonzero(as_tuple=True)[0]
-
-                    #         log_rank_0("")
-                    #         log_rank_0(f"--- FULL SEQUENCE ({len(global_indices)} tokens) ---")
-                    #         log_rank_0(
-                    #             f"{'Pos':<6} | {'Token':<25} | {'Adv':>10} | {'Scalar':>8} | {'Loss':>12} | {'Ratio':>8}"
-                    #         )
-                    #         log_rank_0("-" * 90)
-
-                    #         for global_idx in global_indices.tolist():
-                    #             tok_id = logprob_ids[0, global_idx].item()
-                    #             tok_str = self.ctx.tokenizer.decode([tok_id])[:22]
-                    #             adv = advantages[0, global_idx].item()
-                    #             scalar = scalars[0, global_idx].item()
-                    #             loss_val = grpo_token_loss[0, global_idx].item()
-                    #             ratio = importance_ratio[0, global_idx].item()
-                    #             log_rank_0(
-                    #                 f"{global_idx:<6} | {repr(tok_str):<25} | {adv:>10.4f} | {scalar:>8.0f} | {loss_val:>12.6f} | {ratio:>8.4f}"
-                    #             )
-
                     #         log_rank_0("=" * 120 + "\n")
 
                     log_rank_0(f"{grpo_token_loss.sum()=}, {grpo_loss=}")
 
                     # backprop (accumulate gradients)
-                    dist.breakpoint()
+                    # dist.breakpoint()
                     grpo_loss.backward()
                     log_rank_0(f"{grpo_token_loss.sum()=}, {grpo_loss=}")
 
@@ -1370,13 +1028,15 @@ class GRPOTrainer:
                     # Log per-microbatch stats
                     torch.cuda.empty_cache()
 
-                    dist.breakpoint()
+                    # dist.breakpoint()
 
                 # After processing all K microbatches in this window, take optimizer step
                 gradnorm = self.take_training_step()
 
-                # Calculate average KL for this step
-                avg_kl = accum_kl_sum
+                # Calculate average KL for this trianing step
+                # TODO: this isn't fully correct, because padded training steps will need to contribute 0 KL,
+                # but this also isn't the reason that the algorithm is struggling to learn right now.
+                average_kl = accum_kl_sum
                 log_rank_0(
                     f"Optimizer Step {self._training_step} | Grad Norm: {gradnorm.item():.4f} | Avg KL: {avg_kl:.6f}"
                 )
@@ -1389,7 +1049,7 @@ class GRPOTrainer:
                             if isinstance(loss_accum, torch.Tensor)
                             else loss_accum,
                             "train/grad_norm": gradnorm.item(),
-                            "train/kl_divergence": avg_kl,
+                            "train/kl_divergence": average_kl,
                         },
                         step=self._training_step,
                     )

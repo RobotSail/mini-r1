@@ -148,7 +148,9 @@ def format_reward_think_answer(response: str) -> float:
     return reward
 
 
-def accuracy_reward_numeric(response: str, ground_truth: int | float) -> tuple[float, bool, bool]:
+def accuracy_reward_numeric(
+    response: str, ground_truth: int | float
+) -> tuple[float, bool, bool]:
     """
     Check if the response contains the correct numeric answer.
 
@@ -176,7 +178,9 @@ def accuracy_reward_numeric(response: str, ground_truth: int | float) -> tuple[f
     return (reward, is_correct, is_parsable)
 
 
-def accuracy_reward_answer_tags(response: str, ground_truth: int | float) -> tuple[float, bool, bool]:
+def accuracy_reward_answer_tags(
+    response: str, ground_truth: int | float
+) -> tuple[float, bool, bool]:
     """
     Check if the response contains the correct numeric answer in <answer> tags.
 
@@ -328,4 +332,4 @@ def get_reward_fn(name: str) -> RewardFn:
 # DEFAULT - Change this to swap reward behavior
 # =============================================================================
 
-DEFAULT_REWARD_FN: RewardFn = math_with_thinking
+DEFAULT_REWARD_FN: RewardFn = REWARD_REGISTRY["gsm8k"]

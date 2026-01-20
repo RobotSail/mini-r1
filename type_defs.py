@@ -134,10 +134,14 @@ class RolloutResult(pydantic.BaseModel):
 
         logprobs = []
         if choice.logprobs is not None:
-            logprobs = [
-                TokenSample(token=lp.token.split(":")[-1], logprob=lp.logprob)
-                for lp in choice.logprobs.content
-            ]
+            logprobs = []
+            for lp in choice.logprobs.content:
+                pieces = lp.token.split(":")
+                assert len(pieces) > 1, (
+                    f"expected more than 1 piece when splitting token by ':': {pieces=}, {lp.token=}"
+                )
+                token = pieces[-1]
+                logprobs.append(TokenSample(token=int(token), logprob=lp.logprob))
 
         return RolloutResult(
             response=choice.message.content,
@@ -181,9 +185,7 @@ class Sample(pydantic.BaseModel):
             if enable_std_trick:
                 rollout.advantage = 0.0
             else:
-                adv = (rollout.score.reward - avg) / (std + eps)
-                # CRITICAL: Clamp advantages to prevent extreme policy updates
-                rollout.advantage = max(-10.0, min(10.0, adv))
+                rollout.advantage = (rollout.score.reward - avg) / (std + eps)
 
         nonzero_adv = sum(1 for r in group if abs(r.advantage) > 1e-6)
         rewards_str = ", ".join(
@@ -318,6 +320,7 @@ class TrainingContext(pydantic.BaseModel):
     train_path: str | None = None
     eval_split: float = 0.0
     output_dir: str | None = None
+    reward_function: str = "gsm8k"
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -473,10 +476,43 @@ class TrainingContext(pydantic.BaseModel):
         if not self._policy_has_changed:
             log_rank_0("skipping vllm update, policy hasn't changed")
             return
+        # In update_vllm_policy, after reload_weights succeeds:
+        test_msgs = [
+            {
+                "content": self.system_msg,
+                "role": "system",
+            },
+            {
+                "content": "Jane has 52 apples and 96 oranges. She trades half of her oranges with Jack, who gives her 20 apricots plus a quantity of melons equivalent to a third of the oranges she gave to Jack. How many fruits does Jane have in total?",
+                "role": "user",
+            },
+        ]
+        # if dist.get_rank() == 0:
+        #     # Quick probe - same prompt should give different logprobs if weights changed
 
+        #     test_resp = httpx.post(
+        #         f"{self.vllm_url}/v1/chat/completions",
+        #         json={
+        #             "model": self.vllm_model_name,
+        #             "messages": test_msgs,
+        #             "logprobs": True,
+        #             "max_completion_tokens": 1,
+        #             "temperature": 0.7,
+        #             "top_p": 1.0,
+        #             "top_k": 0,
+        #             "skip_special_tokens": False,
+        #             "add_generation_prompt": True,
+        #         },
+        #     )
+        #     log_rank_0(f"Pre-reload probe: {test_resp.json()['choices'][0]}")
+
+        # log_rank_0("before policy save")
+        # dist.breakpoint()
         # first we have to write the checkpoint to the directory where we expect
         self.save_model(self.vllm_model_dir, self.model, self.tokenizer, torch.float16)
         torch.cuda.empty_cache()
+        # log_rank_0("after policy save")
+        # dist.breakpoint()
 
         # Next, we need to force vLLM to reload the weights
         if dist.get_rank() == 0:
@@ -487,13 +523,49 @@ class TrainingContext(pydantic.BaseModel):
             log_rank_0("waiting for inference server to reload weights")
             resp.raise_for_status()  # fail fast if something went wrong
 
-            # clear stale prefix cache
-            log_rank_0("clearing kv cache from inference server")
+            # Wait for weight reload to fully complete before clearing cache
+            time.sleep(1.0)
+
+            # Clear stale prefix cache with retries
+            # The cache reset can fail if blocks are still in use from in-flight requests
+            max_retries = 10
+            retry_delay = 0.5
+            cache_cleared = False
+
+            for attempt in range(max_retries):
+                log_rank_0("clearing kv cache from inference server")
             resp = httpx.post(f"{self.vllm_url}/reset_prefix_cache")
             log_rank_0("waiting for inference server to clear kv cache")
             resp.raise_for_status()
+        # dist.barrier()
+
+        # if dist.get_rank() == 0:
+        #     # Quick probe - same prompt should give different logprobs if weights changed
+
+        #     test_resp = httpx.post(
+        #         f"{self.vllm_url}/v1/chat/completions",
+        #         json={
+        #             "model": self.vllm_model_name,
+        #             "messages": test_msgs,
+        #             "max_tokens": 1,
+        #             "logprobs": True,
+        #             "max_completion_tokens": 1,
+        #             "temperature": 0.7,
+        #             "top_p": 1.0,
+        #             "top_k": 0,
+        #             "skip_special_tokens": False,
+        #             "add_generation_prompt": True,
+        #         },
+        #     )
+        #     log_rank_0(f"Pre-reload probe: {test_resp.json()['choices'][0]}")
+        log_rank_0("waiting for other nodes")
         dist.barrier()
+        log_rank_0("initiating 15s wait to sanity-check policy reload")
+        time.sleep(15)
+        dist.barrier()
+
         log_rank_0("successfully reloaded policy")
+        # dist.breakpoint()
 
         # fresh update
         self._policy_has_changed = False
@@ -779,3 +851,13 @@ class TrainingContext(pydantic.BaseModel):
         os.makedirs(suffix, exist_ok=True)
         log_rank_0(f"saving checkpoint at {save_dir:!}")
         self.save_model(save_dir, self.model, self.tokenizer, torch.float32)
+        # After save_model completes
+        if dist.get_rank() == 0:
+            import hashlib
+            from pathlib import Path
+
+            # Hash the saved weights to verify they changed
+            weights_path = Path(self.vllm_model_dir) / "model.safetensors"
+            if weights_path.exists():
+                h = hashlib.md5(weights_path.read_bytes()).hexdigest()[:8]
+                log_rank_0(f"Saved weights hash: {h}")
