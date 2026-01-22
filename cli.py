@@ -133,21 +133,13 @@ def generate_data(
 
 @app.command()
 def eval(
-    eval_path: str = typer.Option(
-        ..., "--eval-path", help="Path to the evaluation dataset (jsonl)"
-    ),
+    eval_path: str = typer.Option(..., "--eval-path", help="Path to the evaluation dataset (jsonl)"),
     model_name: str = typer.Option(..., "--model", "-m", help="Model name or path"),
     gpu: int = typer.Option(0, "--gpu", "-g", help="CUDA GPU index to use"),
-    max_new_tokens: int = typer.Option(
-        128, help="Maximum number of new tokens to generate"
-    ),
-    max_seq_len: int = typer.Option(
-        8192, "--msl", "--max-seq-len", help="Maximum sequence length"
-    ),
+    max_new_tokens: int = typer.Option(128, help="Maximum number of new tokens to generate"),
+    max_seq_len: int = typer.Option(8192, "--msl", "--max-seq-len", help="Maximum sequence length"),
     temperature: float = typer.Option(0.7, "-t", "--temp", help="Sampling temperature"),
-    group_size: int = typer.Option(
-        1, "-G", "--group-size", help="Number of rollouts per prompt (for pass@k)"
-    ),
+    group_size: int = typer.Option(1, "-G", "--group-size", help="Number of rollouts per prompt (for pass@k)"),
 ):
     """Run evaluation on a dataset without training."""
     device = torch.device("cuda", gpu)
@@ -175,28 +167,16 @@ def eval(
 
     percent_scores = []
     for sample in samples:
-        passing_rate = sum(1 if r.is_correct else 0 for r in sample.rollouts) / len(
-            sample.rollouts
-        )
+        passing_rate = sum(1 if r.is_correct else 0 for r in sample.rollouts) / len(sample.rollouts)
         percent_scores.append(passing_rate)
 
-    percent_above_50 = (
-        sum(1 if score > 0.5 else 0 for score in percent_scores)
-        / len(percent_scores)
-        * 100
-    )
-    percent_at_100 = (
-        sum(1 if score == 1.0 else 0 for score in percent_scores)
-        / len(percent_scores)
-        * 100
-    )
+    percent_above_50 = sum(1 if score > 0.5 else 0 for score in percent_scores) / len(percent_scores) * 100
+    percent_at_100 = sum(1 if score == 1.0 else 0 for score in percent_scores) / len(percent_scores) * 100
 
     log.info("=== Evaluation Results ===")
     log.info(f"Model: {model_name}")
     log.info(f"Samples: {len(samples)}")
-    log.info(
-        f"Pass@{group_size}: {percent_above_50:.1f}% above 50% | {percent_at_100:.1f}% at 100%"
-    )
+    log.info(f"Pass@{group_size}: {percent_above_50:.1f}% above 50% | {percent_at_100:.1f}% at 100%")
 
 
 class GRPOTrainer:
@@ -215,13 +195,9 @@ class GRPOTrainer:
         self.ctx = ctx
         # load the dataset
         if ctx.dataset == "json":
-            self.train_dataset, self.eval_dataset = ProblemDataset.from_jsonl(
-                ctx.train_path, ctx.eval_split
-            )
+            self.train_dataset, self.eval_dataset = ProblemDataset.from_jsonl(ctx.train_path, ctx.eval_split)
         elif ctx.dataset == "gsm8k":
-            self.train_dataset, self.eval_dataset = ProblemDataset.from_gsm8k(
-                ctx.eval_split
-            )
+            self.train_dataset, self.eval_dataset = ProblemDataset.from_gsm8k(ctx.eval_split)
         self._training_step = 0
 
         # Print dataset statistics
@@ -241,9 +217,7 @@ class GRPOTrainer:
         self.ctx.wrap_models_with_fsdp2()
 
         # Create the train loader now that distributed is initialized
-        self.train_loader = self._create_problem_data_loader(
-            self.train_dataset, self.ctx.hparams.batch_size
-        )
+        self.train_loader = self._create_problem_data_loader(self.train_dataset, self.ctx.hparams.batch_size)
 
     def _create_problem_data_loader(self, dataset: ProblemDataset, batch_size: int):
         """Create a distributed data loader for the problem dataset (for rollout generation)."""
@@ -264,9 +238,7 @@ class GRPOTrainer:
         )
 
     @torch.no_grad
-    def simple_rollouts(
-        self, batch: list[Problem], max_seq_len: int, is_eval=False, n_completions=None
-    ):
+    def simple_rollouts(self, batch: list[Problem], max_seq_len: int, is_eval=False, n_completions=None):
         log_rank_0("making call to update vLLM policy")
         self.ctx.update_vllm_policy()
         if not is_eval:
@@ -315,20 +287,14 @@ class GRPOTrainer:
             # now we go and determine the passing rate
             percent_scores = []
             for sample in samples:
-                passing_rate = sum(
-                    1 if r.score.is_correct else 0 for r in sample.rollouts
-                ) / len(sample.rollouts)
+                passing_rate = sum(1 if r.score.is_correct else 0 for r in sample.rollouts) / len(sample.rollouts)
                 percent_scores.append(passing_rate)
             # Calculate statistics
             percent_above_50 = (
-                sum(1 if score > 0.5 else 0 for score in percent_scores)
-                / max(len(percent_scores), 1)
-                * 100
+                sum(1 if score > 0.5 else 0 for score in percent_scores) / max(len(percent_scores), 1) * 100
             )
             percent_at_100 = (
-                sum(1 if score == 1.0 else 0 for score in percent_scores)
-                / max(len(percent_scores), 1)
-                * 100
+                sum(1 if score == 1.0 else 0 for score in percent_scores) / max(len(percent_scores), 1) * 100
             )
 
             results.append((npass, percent_above_50, percent_at_100))
@@ -365,9 +331,7 @@ class GRPOTrainer:
         from functools import partial
 
         # Create the collate function with pad token
-        _collate_fn = partial(
-            grpo_collate_fn, pad_token_id=self.ctx.tokenizer.pad_token_id
-        )
+        _collate_fn = partial(grpo_collate_fn, pad_token_id=self.ctx.tokenizer.pad_token_id)
 
         # Create the JsonlDataset from samples
         ds = JsonlDataset(dataset=samples, pad_token_id=self.ctx.tokenizer.pad_token_id)
@@ -379,9 +343,7 @@ class GRPOTrainer:
         accumulation_steps = max(1, self.ctx.hparams.inner_batch_size // world_size)
         accumulation_steps = None
 
-        log_rank_0(
-            f"Using {accumulation_steps} accumulation steps per optimizer update"
-        )
+        log_rank_0(f"Using {accumulation_steps} accumulation steps per optimizer update")
 
         # Use the distributed packing dataloader
         # This ensures all ranks do exactly K microbatches per accumulation window
@@ -427,8 +389,7 @@ class GRPOTrainer:
         # check if it's time to update the reference policy
         if (
             self.ctx.hparams.update_ref_policy_every_n_steps > 0
-            and self._training_step % self.ctx.hparams.update_ref_policy_every_n_steps
-            == 0
+            and self._training_step % self.ctx.hparams.update_ref_policy_every_n_steps == 0
         ):
             self.update_reference_policy()
 
@@ -475,29 +436,13 @@ class GRPOTrainer:
             self._print_sample_rollouts(rollouts, num_samples=2)
 
             # Calculate average reward, accuracy, and parse rate for this batch
-            total_rewards = sum(
-                rollout.score.reward
-                for sample in rollouts
-                for rollout in sample.rollouts
-            )
-            total_correct = sum(
-                1
-                for sample in rollouts
-                for rollout in sample.rollouts
-                if rollout.score.is_correct
-            )
-            total_parsable = sum(
-                1
-                for sample in rollouts
-                for rollout in sample.rollouts
-                if rollout.score.is_parsable
-            )
+            total_rewards = sum(rollout.score.reward for sample in rollouts for rollout in sample.rollouts)
+            total_correct = sum(1 for sample in rollouts for rollout in sample.rollouts if rollout.score.is_correct)
+            total_parsable = sum(1 for sample in rollouts for rollout in sample.rollouts if rollout.score.is_parsable)
             total_rollouts = sum(len(sample.rollouts) for sample in rollouts)
             avg_reward = total_rewards / total_rollouts if total_rollouts > 0 else 0.0
             avg_accuracy = total_correct / total_rollouts if total_rollouts > 0 else 0.0
-            avg_parse_rate = (
-                total_parsable / total_rollouts if total_rollouts > 0 else 0.0
-            )
+            avg_parse_rate = total_parsable / total_rollouts if total_rollouts > 0 else 0.0
 
             # Update tqdm postfix with average reward and accuracy
             pbar.set_postfix(
@@ -567,9 +512,7 @@ class GRPOTrainer:
         # Print rollout summary table
         log.info(f"--- Rollout Summary ({len(rollouts)} rollouts) ---")
         log.info("Rank | Reward | Correct | Parsed Answer        | Last 40 chars")
-        log.info(
-            "-----|--------|---------|----------------------|------------------------------------------"
-        )
+        log.info("-----|--------|---------|----------------------|------------------------------------------")
 
         max_rows = 10
         for idx, rollout in enumerate(sorted_rollouts[:max_rows]):
@@ -583,9 +526,7 @@ class GRPOTrainer:
                 if len(rollout.response) >= 40
                 else rollout.response.replace("\n", "↵")
             )
-            log.info(
-                f"{rank:>3}{marker} | {reward:>6} | {correct:>7} | {parsed:<20} | {last_40}"
-            )
+            log.info(f"{rank:>3}{marker} | {reward:>6} | {correct:>7} | {parsed:<20} | {last_40}")
 
         if len(sorted_rollouts) > max_rows:
             log.info(f"... ({len(sorted_rollouts) - max_rows} more rollouts)")
@@ -598,9 +539,7 @@ class GRPOTrainer:
         log.info("--- Best Rollout Details ---")
         log.info(f"[PROBLEM] {sample.problem.problem}")
         response_preview = (
-            best_rollout.response[:500] + "..."
-            if len(best_rollout.response) > 500
-            else best_rollout.response
+            best_rollout.response[:500] + "..." if len(best_rollout.response) > 500 else best_rollout.response
         )
         log.info(f"[OUTPUT]\n{response_preview}")
         log.info("=" * 60)
@@ -631,19 +570,13 @@ class GRPOTrainer:
                     dtype=torch.long,
                     device=self.ctx.device,
                 )
-                logprob_ids = torch.tensor(
-                    [rollout.token_ids], dtype=torch.long, device=self.ctx.device
-                )
+                logprob_ids = torch.tensor([rollout.token_ids], dtype=torch.long, device=self.ctx.device)
 
                 # ADD: Create flash attention kwargs for single sequence
                 seq_len = full_seq.shape[1]
                 flash_attn_kwargs = {
-                    "cu_seq_lens_q": torch.tensor(
-                        [0, seq_len], dtype=torch.int32, device=self.ctx.device
-                    ),
-                    "cu_seq_lens_k": torch.tensor(
-                        [0, seq_len], dtype=torch.int32, device=self.ctx.device
-                    ),
+                    "cu_seq_lens_q": torch.tensor([0, seq_len], dtype=torch.int32, device=self.ctx.device),
+                    "cu_seq_lens_k": torch.tensor([0, seq_len], dtype=torch.int32, device=self.ctx.device),
                     "max_length_q": seq_len,
                     "max_length_k": seq_len,
                 }
@@ -669,13 +602,9 @@ class GRPOTrainer:
                 logprob_ids = logprob_ids.unsqueeze(-1)
 
                 # now we need to pluck out the logits we care about
-                old_logits = torch.gather(
-                    logits, dim=-1, index=logprob_ids
-                )  # (1, T, 1)
+                old_logits = torch.gather(logits, dim=-1, index=logprob_ids)  # (1, T, 1)
                 old_logsumexp = logits.logsumexp(dim=-1, keepdim=True)  # (1, T, 1)
-                old_logprobs = (
-                    old_logits - old_logsumexp
-                )  # should be equivalent to log(p(x))
+                old_logprobs = old_logits - old_logsumexp  # should be equivalent to log(p(x))
 
                 # dist.breakpoint()
                 # old logprobs: (1, T, 1)
@@ -699,9 +628,7 @@ class GRPOTrainer:
                 for i, t in enumerate(rollout.logprobs):
                     t.logprob = old_logprobs_offline[i]
 
-                assert full_seq.shape == position_ids.shape, (
-                    f"{full_seq.shape=} != {position_ids.shape=}"
-                )
+                assert full_seq.shape == position_ids.shape, f"{full_seq.shape=} != {position_ids.shape=}"
 
                 # wait for all
                 dist.barrier()
@@ -712,9 +639,7 @@ class GRPOTrainer:
         any_rewards = sum(r.score.reward for sample in samples for r in sample.rollouts)
 
         # Reduce rewards across all ranks
-        rewards_tensor = torch.tensor(
-            [any_rewards], dtype=torch.float32, device=self.ctx.device
-        )
+        rewards_tensor = torch.tensor([any_rewards], dtype=torch.float32, device=self.ctx.device)
         dist.all_reduce(rewards_tensor, op=dist.ReduceOp.SUM)
         # total_rewards = rewards_tensor.item()
 
@@ -739,9 +664,7 @@ class GRPOTrainer:
                 batch_count += 1
                 log_rank_0(f"[DEBUG] Processing minibatch {batch_count}")
                 # at the start of the microbatch, every rank announces the length they are packing to
-                num_samples_in_local_minibatch = minibatch[
-                    "num_samples_in_local_minibatch"
-                ]
+                num_samples_in_local_minibatch = minibatch["num_samples_in_local_minibatch"]
                 batch_size = torch.tensor(
                     [num_samples_in_local_minibatch],
                     device=torch.device("cuda"),
@@ -751,10 +674,7 @@ class GRPOTrainer:
                 batch_size = batch_size.item()
                 assert batch_size == self.ctx.hparams.inner_batch_size
 
-                batch_structure = [
-                    "." if not mb["padding"] else "#"
-                    for mb in minibatch["microbatches"]
-                ]
+                batch_structure = ["." if not mb["padding"] else "#" for mb in minibatch["microbatches"]]
                 for curr_r in range(dist.get_world_size()):
                     if curr_r == dist.get_rank():
                         print(f"rank {curr_r}: [" + " ".join(batch_structure) + "]")
@@ -801,13 +721,9 @@ class GRPOTrainer:
                     logprob_ids = batch["logprob_ids"].to(self.ctx.device).unsqueeze(0)
                     advantages = batch["advantages"].to(self.ctx.device).unsqueeze(0)
                     old_logprobs = batch["logprobs"].to(self.ctx.device).unsqueeze(0)
-                    grpo_logit_mask = (
-                        batch["grpo_mask"].to(self.ctx.device).unsqueeze(0)
-                    )
+                    grpo_logit_mask = batch["grpo_mask"].to(self.ctx.device).unsqueeze(0)
                     scalars = batch["scalars"].to(self.ctx.device).unsqueeze(0)
-                    position_ids = (
-                        batch["position_ids"].to(self.ctx.device).unsqueeze(0)
-                    )
+                    position_ids = batch["position_ids"].to(self.ctx.device).unsqueeze(0)
                     cu_seq_lens_q = batch["cu_seq_lens_q"].to(self.ctx.device)
                     cu_seq_lens_k = batch["cu_seq_lens_k"].to(self.ctx.device)
                     max_length_q = batch["max_length_q"]
@@ -855,9 +771,7 @@ class GRPOTrainer:
                     # backprop on this model
                     # with torch.no_grad():
                     with torch.no_grad():
-                        ref_outputs = self.ctx.ref_model(
-                            input_ids, position_ids=position_ids, **flash_attn_kwargs
-                        )
+                        ref_outputs = self.ctx.ref_model(input_ids, position_ids=position_ids, **flash_attn_kwargs)
                         ref_logits = ref_outputs.logits.float()
                         assert ref_logits.shape == (1, T, V)
                         # log_rank_0(
@@ -870,9 +784,7 @@ class GRPOTrainer:
                             # )
                         # 2. Calculate the ref logprobs
                         # with torch.no_grad():
-                        ref_gathered_logits = ref_logits.gather(
-                            dim=-1, index=gather_indices
-                        )
+                        ref_gathered_logits = ref_logits.gather(dim=-1, index=gather_indices)
                         assert ref_gathered_logits.shape == (1, T, 1)
                         ref_gathered_logits = ref_gathered_logits.squeeze(-1)
                         assert ref_gathered_logits.shape == (1, T)
@@ -880,9 +792,7 @@ class GRPOTrainer:
                         #     f"[GRPO] Step 7: Gather ref logits | ref_logits: {ref_logits.shape}, gather_indices: {gather_indices.shape} -> ref_gathered_logits: {ref_gathered_logits.shape}"
                         # )
 
-                        ref_logsumexp = ref_logits.logsumexp(
-                            dim=-1, keepdim=True
-                        )  # (B, T, 1)
+                        ref_logsumexp = ref_logits.logsumexp(dim=-1, keepdim=True)  # (B, T, 1)
                         assert ref_logsumexp.shape == (1, T, 1)
                         ref_logsumexp = ref_logsumexp.squeeze(-1)
                         assert ref_logsumexp.shape == (1, T)
@@ -901,14 +811,10 @@ class GRPOTrainer:
                     # 3. Calculate the latest logprobs
                     # more efficient technique
                     # (1, B, V) --> (1, B, 1)
-                    new_gathered_logits = new_logits.gather(
-                        dim=-1, index=gather_indices
-                    )
+                    new_gathered_logits = new_logits.gather(dim=-1, index=gather_indices)
                     assert new_gathered_logits.shape == (1, T, 1)
 
-                    new_gathered_logits = new_gathered_logits.squeeze(
-                        -1
-                    )  # (1, B, 1) --> (1, B)
+                    new_gathered_logits = new_gathered_logits.squeeze(-1)  # (1, B, 1) --> (1, B)
                     assert new_gathered_logits.shape == (1, T)
                     # log_rank_0(
                     #     f"[GRPO] Step 4: Gather new logits | new_logits: {new_logits.shape}, gather_indices: {gather_indices.shape} -> new_gathered_logits: {new_gathered_logits.shape}"
@@ -917,9 +823,7 @@ class GRPOTrainer:
                     new_logits: torch.Tensor
 
                     # (1, B, V) --> (1, B, 1) , computes log(sum(exp(k) for k in logits))
-                    new_logsumexp = new_logits.logsumexp(
-                        dim=-1, keepdim=True
-                    )  # (1, B, 1)
+                    new_logsumexp = new_logits.logsumexp(dim=-1, keepdim=True)  # (1, B, 1)
                     assert new_logsumexp.shape == (1, T, 1)
                     new_logsumexp = new_logsumexp.squeeze(-1)  # (1, B, 1) -> (1, B)
                     assert new_logsumexp.shape == (1, T)
@@ -936,23 +840,17 @@ class GRPOTrainer:
                     B, T = new_logprobs.shape
                     assert B == 1
 
-                    importance_ratio: torch.Tensor = (
-                        (new_logprobs - old_logprobs).clamp(-20, 20).exp()
-                    )
+                    importance_ratio: torch.Tensor = (new_logprobs - old_logprobs).clamp(-20, 20).exp()
                     assert importance_ratio.shape == (1, T)
 
                     # (1,B) * (1,B)
                     unclipped = advantages * importance_ratio
-                    assert importance_ratio.shape == (1, T), (
-                        f"{importance_ratio.shape} != {(1, T)}"
-                    )
+                    assert importance_ratio.shape == (1, T), f"{importance_ratio.shape} != {(1, T)}"
                     assert advantages.shape == (1, T), f"{advantages.shape} != {(1, T)}"
                     assert unclipped.shape == (1, T), f"{unclipped.shape} != {(1, T)}"
 
                     # (1,B) * (1,B)
-                    clipped_ratio = importance_ratio.clamp(
-                        1 - self.ctx.hparams.eps, 1 + self.ctx.hparams.eps
-                    )
+                    clipped_ratio = importance_ratio.clamp(1 - self.ctx.hparams.eps, 1 + self.ctx.hparams.eps)
                     assert clipped_ratio.shape == (1, T)
                     clipped = advantages * clipped_ratio
                     assert clipped_ratio.shape == (1, T)
@@ -980,10 +878,7 @@ class GRPOTrainer:
                     assert dkl_approx.shape == clipped_surrogate.shape, (
                         f"{dkl_approx.shape=} != {clipped_surrogate.shape=}"
                     )
-                    per_token_loss = (
-                        clipped_surrogate
-                        - self.ctx.hparams.kl_penalty_strength * dkl_approx
-                    )
+                    per_token_loss = clipped_surrogate - self.ctx.hparams.kl_penalty_strength * dkl_approx
                     assert per_token_loss.shape == (1, T)
                     # 8. Mask out all invalid logprobs that aren't from the GRPO rollouts
                     assert grpo_logit_mask.shape == (1, T)
@@ -998,9 +893,7 @@ class GRPOTrainer:
                     # we need to multiply our loss by the world size because FSDP2 will try to average the loss by the world size
                     # so we just want the token loss across all ranks [(a1 + ... + ak) + (b1+ ...+)] / batch size
                     # assert dist.get_world_size() == 1  # debug
-                    grpo_sequence_loss = (
-                        grpo_token_loss.sum(dim=-1) * dist.get_world_size()
-                    ) / batch_size
+                    grpo_sequence_loss = (grpo_token_loss.sum(dim=-1) * dist.get_world_size()) / batch_size
                     assert grpo_sequence_loss.shape == (1,)
 
                     grpo_loss = -grpo_sequence_loss
@@ -1045,9 +938,7 @@ class GRPOTrainer:
                 if dist.get_rank() == 0:
                     wandb.log(
                         {
-                            "train/loss": loss_accum.item()
-                            if isinstance(loss_accum, torch.Tensor)
-                            else loss_accum,
+                            "train/loss": loss_accum.item() if isinstance(loss_accum, torch.Tensor) else loss_accum,
                             "train/grad_norm": gradnorm.item(),
                             "train/kl_divergence": average_kl,
                         },
@@ -1065,21 +956,15 @@ def train(
     # we need to know where to load the model from
     model_dir: str = typer.Option(..., help="Path where the model will be loaded from"),
     # for inference
-    vllm_url: str = typer.Option(
-        "http://localhost:8000/v1", "--vllm-url", help="vLLM endpoint"
-    ),
-    vllm_model_name: str = typer.Option(
-        ..., "--vllm-model-name", help="Name of the model being hosted in vLLM"
-    ),
+    vllm_url: str = typer.Option("http://localhost:8000/v1", "--vllm-url", help="vLLM endpoint"),
+    vllm_model_name: str = typer.Option(..., "--vllm-model-name", help="Name of the model being hosted in vLLM"),
     vllm_model_dir: str = typer.Option(
         ...,
         "--vllm-model-dir",
         help="Directory where vLLM expects to reload the model from",
     ),
     # dataset parameters, we'll eventually move these to a data generation command
-    train_path: str | None = typer.Option(
-        None, "--train-path", help="Path to the training data"
-    ),
+    train_path: str | None = typer.Option(None, "--train-path", help="Path to the training data"),
     dataset: str = typer.Option(
         "gsm8k",
         "--dataset",
@@ -1089,14 +974,10 @@ def train(
     num_problems: int = typer.Option(20, help="Number of problems"),
     min_num: int = typer.Option(-100, help="Minimum number for problems"),
     max_num: int = typer.Option(100, help="Maximum number for problems"),
-    system_msg: str | None = typer.Option(
-        None, "--system-msg", help="System message to prompt the model"
-    ),
+    system_msg: str | None = typer.Option(None, "--system-msg", help="System message to prompt the model"),
     # model
     # training params
-    max_new_tokens: int = typer.Option(
-        128, help="The maximum number of new tokens that the model can generate."
-    ),
+    max_new_tokens: int = typer.Option(128, help="The maximum number of new tokens that the model can generate."),
     msl_post: int = typer.Option(
         2**16,
         help="maximum length of the sequences that we work with",
@@ -1119,9 +1000,7 @@ def train(
     # device selection
     # GRPO params
     inner_epochs: int = typer.Option(1, help="Number of passes on inner generation"),
-    inner_batch_size: int = typer.Option(
-        4, "--inner-batch-size", help="Batch size during the GRPO inner loop."
-    ),
+    inner_batch_size: int = typer.Option(4, "--inner-batch-size", help="Batch size during the GRPO inner loop."),
     batch_size: int = typer.Option(
         1,
         "-B",
@@ -1146,15 +1025,9 @@ def train(
         is_flag=True,
     ),
     temperature: float = typer.Option(0.7, "-t", "--temp", help="sampling temperature"),
-    clip_eps: float = typer.Option(
-        0.1, "--clip-eps", help="epsilon used for GRPO clip"
-    ),
-    kl_strength: float = typer.Option(
-        0.01, "--kl", help="strength of the kl penalty to the reference policy"
-    ),
-    dr_grpo: bool = typer.Option(
-        False, "--dr-grpo", help="Whether to use the DR-GRPO algorithm", is_flag=True
-    ),
+    clip_eps: float = typer.Option(0.1, "--clip-eps", help="epsilon used for GRPO clip"),
+    kl_strength: float = typer.Option(0.01, "--kl", help="strength of the kl penalty to the reference policy"),
+    dr_grpo: bool = typer.Option(False, "--dr-grpo", help="Whether to use the DR-GRPO algorithm", is_flag=True),
     # eval split
     eval_split: float = typer.Option(
         0.0,
@@ -1269,15 +1142,9 @@ def stream_output(stream, prefix, file=sys.stdout):
 @app.command()
 def orchestrator(
     model_write_dir: str = "/dev/shm/mini-r1/current-model",
-    checkpoint_dir: str | None = typer.Option(
-        None, "--checkpoint-dir", help="Directory to save the checkpoint in"
-    ),
-    train_gpus: int = typer.Option(
-        6, "--train-gpus", help="Num GPUs to be used for training"
-    ),
-    vllm_gpus: int = typer.Option(
-        2, "--vllm-gpus", help="Num GPUs to be used for the vLLM server"
-    ),
+    checkpoint_dir: str | None = typer.Option(None, "--checkpoint-dir", help="Directory to save the checkpoint in"),
+    train_gpus: int = typer.Option(6, "--train-gpus", help="Num GPUs to be used for training"),
+    vllm_gpus: int = typer.Option(2, "--vllm-gpus", help="Num GPUs to be used for the vLLM server"),
     use_olmo: bool = typer.Option(
         False,
         "--use-olmo",
@@ -1298,18 +1165,10 @@ def orchestrator(
     # batch_size: int = typer.Option(288, "--batch-size", help="Batch size (for generation)"),
     # batch_size: int = typer.Option(54, "--batch-size", help="Batch size (for generation)"),
     # defaults are based on R1 Zero pipeline. R1 Zero used a batch size of 512, we have 6 GPUs so use 510
-    batch_size: int = typer.Option(
-        48, "--batch-size", help="Batch size (for generation)"
-    ),
-    group_size: int = typer.Option(
-        16, "--group-size", help="Rollout size (num rollouts to generate/batch)"
-    ),
-    inner_batch_size: int = typer.Option(
-        32, "--inner-batch-size", help="Inner batch size for the GRPO update step"
-    ),
-    inner_epochs: int = typer.Option(
-        2, "--inner-epochs", help="Number of inner epochs"
-    ),
+    batch_size: int = typer.Option(48, "--batch-size", help="Batch size (for generation)"),
+    group_size: int = typer.Option(16, "--group-size", help="Rollout size (num rollouts to generate/batch)"),
+    inner_batch_size: int = typer.Option(32, "--inner-batch-size", help="Inner batch size for the GRPO update step"),
+    inner_epochs: int = typer.Option(2, "--inner-epochs", help="Number of inner epochs"),
     clip_eps: float = typer.Option(0.1, "--clip-eps", help="Epsilon for the GRPO clip"),
     epochs: int = typer.Option(10, "--epochs", help="Number of epochs"),
     ref_update_frequency: int = typer.Option(
@@ -1317,9 +1176,7 @@ def orchestrator(
         "--ref-update-frequency",
         help="The frequency (in steps) in which the reference policy is updated.",
     ),
-    max_tokens_per_gpu: int = typer.Option(
-        2**11, "--max-tokens-per-gpu", help="Maximum tokens per GPU"
-    ),
+    max_tokens_per_gpu: int = typer.Option(2**11, "--max-tokens-per-gpu", help="Maximum tokens per GPU"),
     msl_post: int = typer.Option(
         2**12,
         help="maximum length of the sequences that we work with",
@@ -1329,9 +1186,7 @@ def orchestrator(
         help="maximum length of the sequences that we work with",
     ),
     max_steps: int = typer.Option(10400, help="Number of training epochs"),
-    max_new_tokens: int = typer.Option(
-        128, help="The maximum number of new tokens that the model can generate."
-    ),
+    max_new_tokens: int = typer.Option(128, help="The maximum number of new tokens that the model can generate."),
     msl_jump_at=typer.Option(8200, help="Number of training epochs"),
     verbose_vllm: bool = typer.Option(False),
     reward_fn: str = typer.Option(
@@ -1346,9 +1201,7 @@ def orchestrator(
         help="CPU offload for reference model to save GPU memory",
         is_flag=True,
     ),
-    dr_grpo: bool = typer.Option(
-        False, "--dr-grpo", help="Whether to use the DR-GRPO algorithm", is_flag=True
-    ),
+    dr_grpo: bool = typer.Option(False, "--dr-grpo", help="Whether to use the DR-GRPO algorithm", is_flag=True),
 ):
     # # first load and write the model
     if use_olmo:
@@ -1362,10 +1215,19 @@ def orchestrator(
 
     vllm_env = os.environ.copy()
     train_env = os.environ.copy()
+    # add project root to PYTHONPATH so vLLM can find the worker extension
+    project_root = os.path.dirname(os.path.abspath(__file__))
+    existing_pythonpath = vllm_env.get("PYTHONPATH", "")
     vllm_env.update(
         {
             "VLLM_SERVER_DEV_MODE": "1",
             "CUDA_VISIBLE_DEVICES": ",".join(str(k) for k in range(vllm_gpus + 1)),
+            # CRITICAL: Disable V1 multiprocessing to fix reload_weights bug
+            # See: https://github.com/vllm-project/vllm/issues/16434
+            # V1 + multiprocessing doesn't properly update model weights during RLHF
+            "VLLM_ENABLE_V1_MULTIPROCESSING": "0",
+            # add project root so vllm_worker_extension can be imported
+            "PYTHONPATH": f"{project_root}:{existing_pythonpath}" if existing_pythonpath else project_root,
         }
     )
     train_gpu_ids = ",".join([str(k) for k in range(vllm_gpus, vllm_gpus + train_gpus)])
@@ -1393,6 +1255,17 @@ def orchestrator(
             str(vllm_gpus),
             "--dtype",
             "float16",  # Match training dtype for consistent logprobs
+            # CRITICAL: Use eager loading to avoid mmap caching stale weights
+            # lazy (default) memory-maps the file which can serve stale data after overwrites
+            "--safetensors-load-strategy",
+            "eager",
+            # CRITICAL: Disable CUDA graphs for RLHF weight reloading
+            # CUDA graphs cache weights in the compiled graph, making reload_weights ineffective
+            "--enforce-eager",
+            # Use custom worker extension for proper weight reloading (Prime RL approach)
+            # See: https://github.com/vllm-project/vllm/issues/16434
+            "--worker-extension-cls",
+            "vllm_worker_extension.FileSystemWeightUpdateWorker",
         ]
         if not verbose_vllm:
             vllm_cmd += ["--disable-log-requests", "--uvicorn-log-level", "warning"]
@@ -1474,12 +1347,8 @@ def orchestrator(
         )
 
         # stream stdout
-        vllm_thread = threading.Thread(
-            target=stream_output, args=(vllm_process.stdout, "VLLM"), daemon=True
-        )
-        training_thread = threading.Thread(
-            target=stream_output, args=(training_process.stdout, "TRAIN"), daemon=True
-        )
+        vllm_thread = threading.Thread(target=stream_output, args=(vllm_process.stdout, "VLLM"), daemon=True)
+        training_thread = threading.Thread(target=stream_output, args=(training_process.stdout, "TRAIN"), daemon=True)
 
         vllm_thread.start()
         training_thread.start()

@@ -188,9 +188,7 @@ class Sample(pydantic.BaseModel):
                 rollout.advantage = (rollout.score.reward - avg) / (std + eps)
 
         nonzero_adv = sum(1 for r in group if abs(r.advantage) > 1e-6)
-        rewards_str = ", ".join(
-            f"{r.score.reward:.1f}" for r in group[:5]
-        )  # Show first 5
+        rewards_str = ", ".join(f"{r.score.reward:.1f}" for r in group[:5])  # Show first 5
         if len(group) > 5:
             rewards_str += "..."
         log_rank_0(
@@ -198,9 +196,7 @@ class Sample(pydantic.BaseModel):
         )
 
     @classmethod
-    def from_chat_completion(
-        cls, problem: Problem, completion: ChatCompletion
-    ) -> "Sample":
+    def from_chat_completion(cls, problem: Problem, completion: ChatCompletion) -> "Sample":
         """
         Makes a call to the current policy to generate a sample from the given
         problem.
@@ -306,9 +302,7 @@ class TrainingContext(pydantic.BaseModel):
     ref_model: PreTrainedModel | None = None
     tokenizer: PreTrainedTokenizerBase | None = None
     hparams: Hyperparameters
-    device: torch.device = pydantic.Field(
-        default_factory=lambda: torch.device("cuda", int(os.environ["LOCAL_RANK"]))
-    )
+    device: torch.device = pydantic.Field(default_factory=lambda: torch.device("cuda", int(os.environ["LOCAL_RANK"])))
     sampling_params: SamplingParams
     device_mesh: DeviceMesh | None = None  # this will start out being none
     ref_model_cpu_offload: bool = False  # CPU offload for ref model to save GPU memory
@@ -322,10 +316,19 @@ class TrainingContext(pydantic.BaseModel):
     output_dir: str | None = None
     reward_function: str = "gsm8k"
 
+    # Diagnostic flags for debugging weight reloading
+    # Set DEBUG_RANDOMIZE_WEIGHTS=1 env var or pass debug_randomize_weights_on_save=True
+    debug_randomize_weights_on_save: bool = False  # When True, randomizes weights during save to test reload
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._vllm_is_ready = False
         self._policy_has_changed = False
+
+        # Check env var for debug mode (easier toggle without code changes)
+        if os.environ.get("DEBUG_RANDOMIZE_WEIGHTS", "").lower() in ("1", "true", "yes"):
+            self.debug_randomize_weights_on_save = True
+            log_rank_0("⚠️  DEBUG_RANDOMIZE_WEIGHTS env var detected - will randomize weights on save!")
 
     def valid_save_dir(self) -> bool:
         if not self.output_dir:
@@ -375,9 +378,7 @@ class TrainingContext(pydantic.BaseModel):
                 )
 
     def create_device_mesh(self):
-        self.device_mesh = init_device_mesh(
-            "cuda", mesh_shape=(self.world_size,), mesh_dim_names=("fsdp",)
-        )
+        self.device_mesh = init_device_mesh("cuda", mesh_shape=(self.world_size,), mesh_dim_names=("fsdp",))
 
     def wrap_models_with_fsdp2(self):
         mp_training_policy = MixedPrecisionPolicy(
@@ -390,9 +391,7 @@ class TrainingContext(pydantic.BaseModel):
             try:
                 self.model.config.use_cache = False
             except Exception as e:
-                print(
-                    f"WARNING: Failed to disable HuggingFace cache for model {self.model.__class__.__name__}: {e}"
-                )
+                print(f"WARNING: Failed to disable HuggingFace cache for model {self.model.__class__.__name__}: {e}")
 
         # select layers
         layers = self.model.model.layers
@@ -425,9 +424,7 @@ class TrainingContext(pydantic.BaseModel):
             reduce_dtype=torch.float32,
         )
         # Optional CPU offload for ref model - keeps params on CPU, loads to GPU during forward
-        ref_offload_policy = (
-            CPUOffloadPolicy(pin_memory=True) if self.ref_model_cpu_offload else None
-        )
+        ref_offload_policy = CPUOffloadPolicy(pin_memory=True) if self.ref_model_cpu_offload else None
         if self.ref_model_cpu_offload:
             log_rank_0("Using CPU offload for reference model")
 
@@ -454,9 +451,7 @@ class TrainingContext(pydantic.BaseModel):
         same_object = model_param is ref_param
         # Check if values are identical (they should be at init, but diverge after training)
         values_equal = torch.equal(model_param, ref_param)
-        log_rank_0(
-            f"DEBUG: After FSDP - same_object: {same_object}, values_equal: {values_equal}"
-        )
+        log_rank_0(f"DEBUG: After FSDP - same_object: {same_object}, values_equal: {values_equal}")
 
         # Create optimizer AFTER FSDP wrapping - this is critical!
         # See https://github.com/pytorch/pytorch/issues/149205
@@ -476,103 +471,61 @@ class TrainingContext(pydantic.BaseModel):
         if not self._policy_has_changed:
             log_rank_0("skipping vllm update, policy hasn't changed")
             return
-        # In update_vllm_policy, after reload_weights succeeds:
-        test_msgs = [
-            {
-                "content": self.system_msg,
-                "role": "system",
-            },
-            {
-                "content": "Jane has 52 apples and 96 oranges. She trades half of her oranges with Jack, who gives her 20 apricots plus a quantity of melons equivalent to a third of the oranges she gave to Jack. How many fruits does Jane have in total?",
-                "role": "user",
-            },
-        ]
-        # if dist.get_rank() == 0:
-        #     # Quick probe - same prompt should give different logprobs if weights changed
 
-        #     test_resp = httpx.post(
-        #         f"{self.vllm_url}/v1/chat/completions",
-        #         json={
-        #             "model": self.vllm_model_name,
-        #             "messages": test_msgs,
-        #             "logprobs": True,
-        #             "max_completion_tokens": 1,
-        #             "temperature": 0.7,
-        #             "top_p": 1.0,
-        #             "top_k": 0,
-        #             "skip_special_tokens": False,
-        #             "add_generation_prompt": True,
-        #         },
-        #     )
-        #     log_rank_0(f"Pre-reload probe: {test_resp.json()['choices'][0]}")
-
-        # log_rank_0("before policy save")
-        # dist.breakpoint()
-        # first we have to write the checkpoint to the directory where we expect
-        self.save_model(self.vllm_model_dir, self.model, self.tokenizer, torch.float16)
+        # Write the checkpoint to the directory where vLLM expects it
+        log_rank_0(f"📁 Saving policy to: {self.vllm_model_dir}")
+        if self.debug_randomize_weights_on_save:
+            log_rank_0("⚠️  DEBUG MODE: Will randomize weights for this policy save!")
+        self.save_model(
+            self.vllm_model_dir,
+            self.model,
+            self.tokenizer,
+            torch.float16,
+            debug_randomize_weights=self.debug_randomize_weights_on_save,
+        )
         torch.cuda.empty_cache()
         # log_rank_0("after policy save")
         # dist.breakpoint()
 
         # Next, we need to force vLLM to reload the weights
+        # vLLM requires: sleep(level=2) -> wake_up(weights) -> reload_weights -> wake_up(kv_cache)
         if dist.get_rank() == 0:
-            log_rank_0("reloading inference server weights")
+            collective_url = f"{self.vllm_url}/collective_rpc"
+            reset_url = f"{self.vllm_url}/reset_prefix_cache"
+
+            # Use custom worker extension to update weights
+            # This bypasses vLLM's broken reload_weights implementation which caches stale data
+            # See: https://github.com/vllm-project/vllm/issues/16434
+            log_rank_0(f"calling update_weights with path: {self.vllm_model_dir}")
             resp = httpx.post(
-                f"{self.vllm_url}/collective_rpc", json={"method": "reload_weights"}
+                collective_url,
+                json={"method": "update_weights", "args": [self.vllm_model_dir]},
+                timeout=120,
             )
-            log_rank_0("waiting for inference server to reload weights")
-            resp.raise_for_status()  # fail fast if something went wrong
-
-            # Wait for weight reload to fully complete before clearing cache
-            time.sleep(1.0)
-
-            # Clear stale prefix cache with retries
-            # The cache reset can fail if blocks are still in use from in-flight requests
-            max_retries = 10
-            retry_delay = 0.5
-            cache_cleared = False
-
-            for attempt in range(max_retries):
-                log_rank_0("clearing kv cache from inference server")
-            resp = httpx.post(f"{self.vllm_url}/reset_prefix_cache")
-            log_rank_0("waiting for inference server to clear kv cache")
+            if resp.status_code != 200:
+                log_rank_0(f"⚠️  update_weights returned {resp.status_code}: {resp.text}")
             resp.raise_for_status()
-        # dist.barrier()
 
-        # if dist.get_rank() == 0:
-        #     # Quick probe - same prompt should give different logprobs if weights changed
+            # Clear stale prefix cache
+            log_rank_0("clearing prefix cache from inference server")
+            resp = httpx.post(reset_url, timeout=60)
+            resp.raise_for_status()
 
-        #     test_resp = httpx.post(
-        #         f"{self.vllm_url}/v1/chat/completions",
-        #         json={
-        #             "model": self.vllm_model_name,
-        #             "messages": test_msgs,
-        #             "max_tokens": 1,
-        #             "logprobs": True,
-        #             "max_completion_tokens": 1,
-        #             "temperature": 0.7,
-        #             "top_p": 1.0,
-        #             "top_k": 0,
-        #             "skip_special_tokens": False,
-        #             "add_generation_prompt": True,
-        #         },
-        #     )
-        #     log_rank_0(f"Pre-reload probe: {test_resp.json()['choices'][0]}")
         log_rank_0("waiting for other nodes")
-        dist.barrier()
-        log_rank_0("initiating 15s wait to sanity-check policy reload")
-        time.sleep(15)
         dist.barrier()
 
         log_rank_0("successfully reloaded policy")
-        # dist.breakpoint()
 
         # fresh update
         self._policy_has_changed = False
 
     @staticmethod
     def save_model(
-        output_dir: str, fsdp_model, tokenizer, save_dtype: torch.dtype = None
+        output_dir: str,
+        fsdp_model,
+        tokenizer,
+        save_dtype: torch.dtype = None,
+        debug_randomize_weights: bool = False,
     ):
         """
         Save the given FSDP Model as a checkpoint in HF Format.
@@ -583,6 +536,8 @@ class TrainingContext(pydantic.BaseModel):
             output_dir (str): The directory to save the model.
             model_name_or_path (str): The model name or path.
             suffix (str | None): Optional suffix to add to the checkpoint directory name.
+            debug_randomize_weights (bool): If True, randomize all weights before saving.
+                                            Used to verify vLLM weight reloading works.
         """
         global_rank = torch.distributed.get_rank()
 
@@ -606,14 +561,21 @@ class TrainingContext(pydantic.BaseModel):
                 broadcast_from_rank0=False,
             ),
         )
+
+        # DIAGNOSTIC: Randomize weights to verify vLLM reload is working
+        if debug_randomize_weights and global_rank == 0:
+            log_rank_0("⚠️  DEBUG: Randomizing ALL weights before save to test reload!")
+            for key in state_dict:
+                original_shape = state_dict[key].shape
+                original_dtype = state_dict[key].dtype
+                # Use normal distribution with similar scale to original weights
+                std = state_dict[key].std().item() if state_dict[key].numel() > 0 else 1.0
+                state_dict[key] = torch.randn(original_shape, dtype=original_dtype) * std
+            log_rank_0("⚠️  DEBUG: Weight randomization complete - model will output GARBAGE")
         inner = getattr(fsdp_model, "module", fsdp_model)
         # save in whatever data type is stored on the model config
         # by now the `torch_dtype` attribute has been set to some value
-        save_dtype = (
-            next(p.dtype for p in fsdp_model.parameters())
-            if save_dtype is None
-            else save_dtype
-        )
+        save_dtype = next(p.dtype for p in fsdp_model.parameters()) if save_dtype is None else save_dtype
 
         # NOTE(osilkin): This save function could be further optimized for quicker checkpoints:
         #
@@ -638,9 +600,7 @@ class TrainingContext(pydantic.BaseModel):
             for k, v in state_dict.items():
                 if v.dtype != save_dtype:
                     if not notified_about_dtype:
-                        log_rank_0(
-                            f"⚠️  Warning: Found tensor {k} with dtype {v.dtype}, casting to {save_dtype}"
-                        )
+                        log_rank_0(f"⚠️  Warning: Found tensor {k} with dtype {v.dtype}, casting to {save_dtype}")
                         notified_about_dtype = True
                     state_dict[k] = v.to(dtype=save_dtype, device=cpu_device)
 
@@ -687,16 +647,12 @@ class TrainingContext(pydantic.BaseModel):
                 # first we need to make sure sure vLLM itself is running
                 response = httpx.get(f"{self.vllm_url}/health", timeout=1)
                 if response.status_code != 200:
-                    raise VllmNotReady(
-                        f"health check return non-200 code: {response.status_code}"
-                    )
+                    raise VllmNotReady(f"health check return non-200 code: {response.status_code}")
 
                 # now check if our model is there
                 response = httpx.get(f"{self.vllm_url}/v1/models", timeout=1)
                 if response.status_code != 200:
-                    raise VllmNotReady(
-                        f"model check return non-200 code: {response.status_code}"
-                    )
+                    raise VllmNotReady(f"model check return non-200 code: {response.status_code}")
 
                 models = response.json().get("data", [])
                 model_names = [model.get("id") for model in models]
@@ -718,9 +674,7 @@ class TrainingContext(pydantic.BaseModel):
 
         # now we can communicate findings
         log_rank_0(f"communicating vllm status to group")
-        readiness_tuple = torch.tensor(
-            [server_is_ready, unexpected_error], dtype=torch.bool, device=self.device
-        )
+        readiness_tuple = torch.tensor([server_is_ready, unexpected_error], dtype=torch.bool, device=self.device)
         dist.broadcast(readiness_tuple, src=0)
 
         server_is_ready, unexpected_error = (
@@ -781,7 +735,8 @@ class TrainingContext(pydantic.BaseModel):
         logprobs=True,
     ):
         # we structure it without condensing here to avoid GC issues
-        async with AsyncOpenAI(base_url=f"{self.vllm_url}/v1", timeout=None) as client:
+        openai_base_url = f"{self.vllm_url}/v1"
+        async with AsyncOpenAI(base_url=openai_base_url, timeout=None) as client:
             tasks = [
                 self._generate_samples_for_problem(
                     client,
@@ -810,9 +765,7 @@ class TrainingContext(pydantic.BaseModel):
         """
 
         include_logprobs = True if include_logprobs is None else include_logprobs
-        n_completions = (
-            self.hparams.group_size if n_completions is None else n_completions
-        )
+        n_completions = self.hparams.group_size if n_completions is None else n_completions
 
         # so we want to loop through all of our samples in the dataset
         # basically we want to take a batch of samples and inititate a network request,
