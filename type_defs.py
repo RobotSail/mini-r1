@@ -484,6 +484,7 @@ class TrainingContext(pydantic.BaseModel):
             debug_randomize_weights=self.debug_randomize_weights_on_save,
         )
         torch.cuda.empty_cache()
+
         # log_rank_0("after policy save")
         # dist.breakpoint()
 
@@ -499,7 +500,7 @@ class TrainingContext(pydantic.BaseModel):
             log_rank_0(f"calling update_weights with path: {self.vllm_model_dir}")
             resp = httpx.post(
                 collective_url,
-                json={"method": "update_weights", "args": [self.vllm_model_dir]},
+                json={"method": "reload_weights"},
                 timeout=120,
             )
             if resp.status_code != 200:
@@ -513,6 +514,10 @@ class TrainingContext(pydantic.BaseModel):
 
         log_rank_0("waiting for other nodes")
         dist.barrier()
+        self._vllm_is_ready = False
+        # Wait for vLLM to be ready with the new weights before proceeding
+        log_rank_0("waiting for vLLM to be ready with new weights...")
+        self.wait_for_vllm_to_be_ready()
 
         log_rank_0("successfully reloaded policy")
 
@@ -620,14 +625,14 @@ class TrainingContext(pydantic.BaseModel):
                 path = os.path.join(output_dir, filename)
                 save_file(shard, path)
 
-            # Save index if sharded
-            if split.is_sharded:
-                index = {
-                    "metadata": split.metadata,
-                    "weight_map": split.tensor_to_filename,
-                }
-                with open(os.path.join(output_dir, index_name), "w") as f:
-                    json.dump(index, f, indent=2, sort_keys=True)
+            # # Save index if sharded
+            # if split.is_sharded:
+            index = {
+                "metadata": split.metadata,
+                "weight_map": split.tensor_to_filename,
+            }
+            with open(os.path.join(output_dir, index_name), "w") as f:
+                json.dump(index, f, indent=2, sort_keys=True)
             # Standard config save for non-GPT-OSS models
             inner.config.to_json_file(os.path.join(output_dir, "config.json"))
             tokenizer.save_pretrained(output_dir)

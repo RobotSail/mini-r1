@@ -1262,10 +1262,6 @@ def orchestrator(
             # CRITICAL: Disable CUDA graphs for RLHF weight reloading
             # CUDA graphs cache weights in the compiled graph, making reload_weights ineffective
             "--enforce-eager",
-            # Use custom worker extension for proper weight reloading (Prime RL approach)
-            # See: https://github.com/vllm-project/vllm/issues/16434
-            "--worker-extension-cls",
-            "vllm_worker_extension.FileSystemWeightUpdateWorker",
         ]
         if not verbose_vllm:
             vllm_cmd += ["--disable-log-requests", "--uvicorn-log-level", "warning"]
