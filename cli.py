@@ -235,6 +235,7 @@ class GRPOTrainer:
             sampler=train_sampler,
             batch_size=batchsize,
             collate_fn=problem_collate_fn,
+            drop_last=True,
         )
 
     @torch.no_grad
@@ -905,12 +906,9 @@ class GRPOTrainer:
                         # log_rank_0(f"[GRPO] Step 22: Zero padding loss | grpo_loss: {grpo_loss.shape} (in-place)")
                     #         log_rank_0("=" * 120 + "\n")
 
-                    log_rank_0(f"{grpo_token_loss.sum()=}, {grpo_loss=}")
-
                     # backprop (accumulate gradients)
                     # dist.breakpoint()
                     grpo_loss.backward()
-                    log_rank_0(f"{grpo_token_loss.sum()=}, {grpo_loss=}")
 
                     # log_rank_0(f"[GRPO] Step 23: Backward pass | grpo_loss: {grpo_loss.shape}")
 
@@ -1044,6 +1042,13 @@ def train(
         "--reward-fn",
         help="Reward function to use. Options: math_with_thinking, accuracy_only, format_only, strict_format_with_accuracy",
     ),
+    wandb_project: str = typer.Option(
+        "mini-r1",
+        "--wandb-project",
+        help="Name of the wandb project to use",
+    ),
+    scheduler: str = typer.Option("cosine_with_restarts", "--scheduler", help="Scheduler to use for the learning rate"),
+    warmup_steps: int = typer.Option(0, "--warmup-steps", help="Number of steps to warmup the model"),
 ):
     # Set the reward function before anything else
     import src.rewards as rewards_module
@@ -1057,7 +1062,7 @@ def train(
     # Initialize wandb on rank 0 only
     if dist.get_rank() == 0:
         wandb.init(
-            project="mini-grpo",
+            project=wandb_project,
             config={
                 "model": model_dir,
                 "dataset": dataset,
@@ -1089,8 +1094,10 @@ def train(
         vllm_url=vllm_url,
         vllm_model_name=vllm_model_name,
         vllm_model_dir=vllm_model_dir,
+        reward_function=reward_fn,
         hparams=Hyperparameters(
             lr=lr,
+            warmup_steps=warmup_steps,
             max_steps=max_steps,
             msl_post=msl_post,
             msl_pre=msl_pre,
@@ -1145,6 +1152,9 @@ def orchestrator(
     checkpoint_dir: str | None = typer.Option(None, "--checkpoint-dir", help="Directory to save the checkpoint in"),
     train_gpus: int = typer.Option(6, "--train-gpus", help="Num GPUs to be used for training"),
     vllm_gpus: int = typer.Option(2, "--vllm-gpus", help="Num GPUs to be used for the vLLM server"),
+    eval_split: float = typer.Option(0.0, "--eval-split", help="Fraction of the training data to use for evaluation"),
+    warmup_steps: int = typer.Option(0, "--warmup-steps", help="Number of steps to warmup the model"),
+    scheduler: str = typer.Option("cosine_with_restarts", "--scheduler", help="Scheduler to use for the learning rate"),
     use_olmo: bool = typer.Option(
         False,
         "--use-olmo",
@@ -1157,7 +1167,8 @@ def orchestrator(
         help="Path or name of the model to train with if not using olmo",
     ),
     system_msg: str | None = typer.Option(
-        "You're a helpful assistant who helps the user solve challenging problems. Always provide your final answer within <answer>...</answer> tags.",
+        # "You're a helpful assistant who helps the user solve challenging problems. Always provide your final answer within <answer>...</answer> tags.",
+        None,
         "--system-msg",
         help="System message to prompt the model",
     ),
@@ -1202,6 +1213,11 @@ def orchestrator(
         is_flag=True,
     ),
     dr_grpo: bool = typer.Option(False, "--dr-grpo", help="Whether to use the DR-GRPO algorithm", is_flag=True),
+    wandb_project: str = typer.Option(
+        "mini-r1",
+        "--wandb-project",
+        help="Name of the wandb project to use",
+    ),
 ):
     # # first load and write the model
     if use_olmo:
@@ -1292,7 +1308,9 @@ def orchestrator(
             "--vllm-url",
             "http://localhost:8000",
             "--eval-split",
-            "0.25",
+            str(eval_split),
+            "--wandb-project",
+            wandb_project,
             "--batch-size",
             str(batch_size),
             "--group-size",
@@ -1325,6 +1343,10 @@ def orchestrator(
             str(inner_epochs),
             "--clip-eps",
             str(clip_eps),
+            "--scheduler",
+            scheduler,
+            "--warmup-steps",
+            str(warmup_steps),
         ]
         if checkpoint_dir:
             train_cmd += ["--output-dir", checkpoint_dir]

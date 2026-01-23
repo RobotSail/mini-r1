@@ -15,6 +15,7 @@ from __future__ import annotations
 import re
 import functools
 from typing import Protocol, Any
+import random
 
 from type_defs import RolloutScore
 
@@ -111,6 +112,11 @@ def extract_answer_from_tags(response: str) -> int | float | None:
 # =============================================================================
 
 
+def random_reward(mean: float = 0, std: float = 1, min_r=0.01):
+    r = random.normalvariate(mean, std)
+    return max(min_r, r)
+
+
 def format_reward_think_answer(response: str) -> float:
     """
     Reward for following the <think>...</think><answer>...</answer> format.
@@ -133,24 +139,24 @@ def format_reward_think_answer(response: str) -> float:
     if len(thoughts) < 1:
         return 0.0
 
-    reward = 0.0
+    # lets do random rewards here
+
+    reward = random_reward(mean=0.1, std=0.05, min_r=0.01)
 
     # Small reward for having thinking content
     if len(thoughts[0].strip()) > 0:
-        reward += 0.1
+        reward += random_reward(mean=0.1, std=0.05, min_r=0.01)
 
     # Check for exactly one answer after the thinking section
     post_think = response.split("</think>")[-1]
     answers = answer_pattern().findall(post_think)
     if len(answers) == 1:
-        reward = 1.0
+        reward += random_reward(mean=1.0, std=0.1, min_r=0.9)
 
     return reward
 
 
-def accuracy_reward_numeric(
-    response: str, ground_truth: int | float
-) -> tuple[float, bool, bool]:
+def accuracy_reward_numeric(response: str, ground_truth: int | float) -> tuple[float, bool, bool]:
     """
     Check if the response contains the correct numeric answer.
 
@@ -173,14 +179,12 @@ def accuracy_reward_numeric(
         return (0.0, False, False)
 
     is_correct = answer == ground_truth
-    reward = 1.0 if is_correct else 0.0
+    reward = random_reward(1.0, 0.3, min_r=0.9) if is_correct else 0.0
 
     return (reward, is_correct, is_parsable)
 
 
-def accuracy_reward_answer_tags(
-    response: str, ground_truth: int | float
-) -> tuple[float, bool, bool]:
+def accuracy_reward_answer_tags(response: str, ground_truth: int | float) -> tuple[float, bool, bool]:
     """
     Check if the response contains the correct numeric answer in <answer> tags.
 
@@ -316,6 +320,7 @@ REWARD_REGISTRY: dict[str, RewardFn] = {
     "accuracy_only": accuracy_only,
     "format_only": format_only,
     "strict_format_with_accuracy": strict_format_with_accuracy,
+    "r1-zero": math_with_thinking,
     "gsm8k": strict_answer_only,
 }
 

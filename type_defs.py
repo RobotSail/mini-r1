@@ -6,6 +6,7 @@ from datetime import timedelta
 from typing import TYPE_CHECKING
 from torch._tensor import Tensor
 import typing as t
+from transformers import get_scheduler
 
 if TYPE_CHECKING:
     from src.rewards import RewardFn
@@ -126,11 +127,14 @@ class RolloutResult(pydantic.BaseModel):
         cls,
         problem: Problem,
         choice: openai.types.chat.chat_completion.Choice,
-        reward_fn: "RewardFn | None" = None,
+        reward_fn: RewardFn | str | None = None,
     ):
-        from src.rewards import DEFAULT_REWARD_FN
+        from src.rewards import DEFAULT_REWARD_FN, REWARD_REGISTRY
 
-        reward_fn = reward_fn or DEFAULT_REWARD_FN
+        if isinstance(reward_fn, str):
+            reward_fn = REWARD_REGISTRY[reward_fn.lower()]
+        else:
+            reward_fn = reward_fn or DEFAULT_REWARD_FN
 
         logprobs = []
         if choice.logprobs is not None:
@@ -196,7 +200,9 @@ class Sample(pydantic.BaseModel):
         )
 
     @classmethod
-    def from_chat_completion(cls, problem: Problem, completion: ChatCompletion) -> "Sample":
+    def from_chat_completion(
+        cls, problem: Problem, completion: ChatCompletion, reward_fn: RewardFn | str | None = None
+    ) -> "Sample":
         """
         Makes a call to the current policy to generate a sample from the given
         problem.
@@ -206,50 +212,9 @@ class Sample(pydantic.BaseModel):
 
         # calculate advantage of group and set it in-place
         for choice in completion.choices:
-            responses.append(RolloutResult.from_problem_completion(problem, choice))
+            responses.append(RolloutResult.from_problem_completion(problem, choice, reward_fn=reward_fn))
         cls.calculate_advantage(responses)
         return cls(input_ids=input_ids, rollouts=responses, problem=problem)
-
-    # def calculate_scores(self):
-    #     # GRPO equation:
-    #     # A_i = (r_i - avg(r)) / std(r)
-    #     # Dr.GRPO Equation:
-    #     # A_i = r_i - avg(r)
-    #     for rollout in self.rollouts:
-    #         # Defaults; if we cannot parse then it is not correct. If we can parse, it is not necessarily correct.
-    #         rollout.is_parsable = False
-    #         rollout.is_correct = False
-
-    #         # reset it here just for good measure
-    #         rollout.reward = 0
-
-    #         # check if the response has any answers at all
-    #         matches = answer_pattern.findall(rollout.response)
-
-    #         # we only want 1 of these
-    #         parsed_nums: list[int | float] = []  #
-    #         for match in matches:  # this is already bad
-    #             try:
-    #                 answer = parse_number(match)
-    #             except Exception as e:
-    #                 print(f"failed to parse text from answer tags: {e}")
-    #             else:
-    #                 parsed_nums.append(answer)
-
-    #         if len(parsed_nums) == 1:
-    #             answer = parsed_nums[0]
-    #             rollout.is_parsable = True
-    #             rollout.is_correct = group.problem.answer == answer
-    #         if len(parsed_nums) > 1:
-    #             rollout.reward -= 0.1
-    #         elif rollout.is_parsable:
-    #             # okay, we WANT the model to produce more answers like this
-    #             # but we don't want to overweight this or give sparse rewards
-    #             # so we will assign a reward here of +1
-    #             rollout.reward += 0.1
-
-    #         if rollout.is_correct:
-    #             rollout.reward += 1  # huge reward for getting it right
 
 
 class Hyperparameters(pydantic.BaseModel):
@@ -267,6 +232,9 @@ class Hyperparameters(pydantic.BaseModel):
     inner_epochs: int = 1
     adamw_betas: tuple[float, float] = (0.9, 0.999)
     adamw_wd: float = 0.01
+
+    scheduler_type: str = "cosine_with_restarts"
+    warmup_steps: int = 0
 
     # packing length for training
     max_tokens_per_gpu: int
@@ -311,6 +279,7 @@ class TrainingContext(pydantic.BaseModel):
     vllm_model_name: str
     vllm_model_dir: str
     dataset: str
+    lr_scheduler: torch.optim.lr_scheduler.LRScheduler | None = None
     train_path: str | None = None
     eval_split: float = 0.0
     output_dir: str | None = None
@@ -461,6 +430,16 @@ class TrainingContext(pydantic.BaseModel):
             betas=self.hparams.adamw_betas,
             weight_decay=self.hparams.adamw_wd,
         )
+        self.lr_scheduler = get_scheduler(
+            "cosine_with_restarts",
+            self.optimizer,
+            num_warmup_steps=self.hparams.warmup_steps,
+            num_training_steps=self.hparams.max_steps,
+            scheduler_specific_kwargs={
+                "num_cycles": 4,
+            },
+        )
+
         log_rank_0("Optimizer created after FSDP wrapping")
 
     @requires_vllm_ready
@@ -793,6 +772,7 @@ class TrainingContext(pydantic.BaseModel):
         # take an optimization step
         gradnorm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
         self.optimizer.step()
+        self.lr_scheduler.step()
         self._policy_has_changed = True
         self.optimizer.zero_grad()
         return gradnorm
